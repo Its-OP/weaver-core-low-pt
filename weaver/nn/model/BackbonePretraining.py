@@ -4,7 +4,7 @@ Self-supervised pretraining via masked track reconstruction:
     1. Randomly mask 40% of input tracks
     2. Encode visible tracks through HierarchicalGraphBackbone → 64 tokens
     3. Decode masked tracks via cross-attention to backbone tokens
-    4. Reconstruct masked track features + 4-vectors
+    4. Reconstruct masked track features (standardized by weaver's pipeline)
 
 The decoder is discarded after pretraining. Only the backbone is kept.
 
@@ -87,14 +87,19 @@ class PositionalEncoding2D(nn.Module):
 class MaskedTrackDecoder(nn.Module):
     """Decoder for masked track reconstruction.
 
-    Similar to MAE/Point-MAE decoders. Reconstructs features + 4-vectors
+    Similar to MAE/Point-MAE decoders. Reconstructs per-track features
     for masked tracks by cross-attending to backbone tokens.
 
     Architecture:
         1. Learnable [MASK] embedding + positional encoding from (η, φ)
         2. Cross-attention: masked track queries attend to backbone tokens
         3. Self-attention: N_layers among masked track queries
-        4. Output projection: Linear(decoder_dim → num_features + 4)
+        4. Output projection: Linear(decoder_dim → num_output_features)
+
+    Note: We only reconstruct pf_features (standardized by weaver), not
+    pf_vectors (raw 4-momenta). The 4-vectors (px, py, pz, E) are fully
+    derivable from the features (which already contain px, py, pz) so
+    reconstructing them separately would add no new learning signal.
 
     Args:
         backbone_dim: Channel dimension of backbone tokens (default: 256).
@@ -161,10 +166,9 @@ class MaskedTrackDecoder(nn.Module):
             ))
             self.feedforward_norms.append(nn.LayerNorm(decoder_dim))
 
-        # Output projection: predict features + 4-vector per masked track
-        # num_output_features + 4 Lorentz-vector components
+        # Output projection: predict features per masked track
         self.output_projection = nn.Linear(
-            decoder_dim, num_output_features + 4
+            decoder_dim, num_output_features
         )
 
     def forward(
@@ -172,7 +176,7 @@ class MaskedTrackDecoder(nn.Module):
         backbone_tokens: torch.Tensor,
         masked_track_coordinates: torch.Tensor,
         num_masked_tracks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Decode masked tracks from backbone tokens.
 
         Args:
@@ -181,9 +185,7 @@ class MaskedTrackDecoder(nn.Module):
             num_masked_tracks: N_masked — number of masked tracks per event.
 
         Returns:
-            Tuple of:
-                predicted_features: (B, num_output_features, N_masked)
-                predicted_lorentz_vectors: (B, 4, N_masked)
+            predicted_features: (B, num_output_features, N_masked)
         """
         batch_size = backbone_tokens.shape[0]
 
@@ -235,18 +237,11 @@ class MaskedTrackDecoder(nn.Module):
             feedforward_output = feedforward(queries)
             queries = feedforward_norm(queries + feedforward_output)
 
-        # Output projection: (B, N_masked, decoder_dim) → (B, N_masked, 11)
-        predictions = self.output_projection(queries)  # (B, N_masked, 11)
+        # Output projection: (B, N_masked, decoder_dim) → (B, N_masked, F)
+        predictions = self.output_projection(queries)
 
-        # Split into features and 4-vector, transpose to (B, C, N_masked)
-        predicted_features = predictions[
-            :, :, :self.num_output_features
-        ].transpose(1, 2)  # (B, num_output_features, N_masked)
-        predicted_lorentz_vectors = predictions[
-            :, :, self.num_output_features:
-        ].transpose(1, 2)  # (B, 4, N_masked)
-
-        return predicted_features, predicted_lorentz_vectors
+        # Transpose to (B, num_output_features, N_masked)
+        return predictions.transpose(1, 2)
 
 
 class MaskedTrackPretrainer(nn.Module):
@@ -256,7 +251,16 @@ class MaskedTrackPretrainer(nn.Module):
         1. Randomly mask a fraction of input tracks
         2. Encode visible tracks through backbone
         3. Decode masked tracks via cross-attention
-        4. Compute reconstruction loss on masked tracks
+        4. Compute feature reconstruction loss (MSE) on masked tracks
+
+    Only features (pf_features) are reconstructed — not 4-vectors, because
+    pf_vectors (px, py, pz, E) are fully derivable from pf_features (which
+    already contain px, py, pz). Reconstructing them would add no new
+    learning signal.
+
+    Features arrive already standardized by weaver's data pipeline
+    (preprocess.method: auto → median-centering + IQR scaling + clipping
+    to [-5, 5]), so the MSE loss is naturally well-scaled.
 
     Returns per-event loss tensor (B,) for integration with weaver's
     train_regression mode.
@@ -265,8 +269,6 @@ class MaskedTrackPretrainer(nn.Module):
         backbone_kwargs: Keyword arguments for HierarchicalGraphBackbone.
         decoder_kwargs: Keyword arguments for MaskedTrackDecoder.
         mask_ratio: Fraction of tracks to mask (default: 0.4).
-        loss_weight_features: λ_feat weight for feature MSE (default: 1.0).
-        loss_weight_lorentz_vectors: λ_lv weight for 4-vector MSE (default: 0.5).
     """
 
     def __init__(
@@ -274,8 +276,6 @@ class MaskedTrackPretrainer(nn.Module):
         backbone_kwargs: dict | None = None,
         decoder_kwargs: dict | None = None,
         mask_ratio: float = 0.4,
-        loss_weight_features: float = 1.0,
-        loss_weight_lorentz_vectors: float = 0.5,
     ):
         super().__init__()
 
@@ -285,8 +285,6 @@ class MaskedTrackPretrainer(nn.Module):
             decoder_kwargs = {}
 
         self.mask_ratio = mask_ratio
-        self.loss_weight_features = loss_weight_features
-        self.loss_weight_lorentz_vectors = loss_weight_lorentz_vectors
 
         self.backbone = HierarchicalGraphBackbone(**backbone_kwargs)
 
@@ -387,16 +385,25 @@ class MaskedTrackPretrainer(nn.Module):
         lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass: mask → encode → decode → compute loss.
+        """Forward pass: mask → encode → decode → compute feature MSE loss.
+
+        Features (pf_features) arrive already standardized by weaver's data
+        pipeline (preprocess.method: auto → median-centering + IQR scaling
+        + clipping to [-5, 5]). The decoder reconstructs these standardized
+        values, and the MSE loss is naturally well-scaled.
+
+        4-vectors (pf_vectors) arrive raw — the backbone needs raw momenta
+        for pairwise_lv_fts(). They are NOT reconstructed because they are
+        fully derivable from the features (which contain px, py, pz).
 
         Args:
             points: (B, 2, P) coordinates in (η, φ).
-            features: (B, input_dim, P) per-track features.
-            lorentz_vectors: (B, 4, P) per-track 4-vectors (px, py, pz, E).
+            features: (B, input_dim, P) per-track features (standardized).
+            lorentz_vectors: (B, 4, P) per-track 4-vectors (raw px, py, pz, E).
             mask: (B, 1, P) boolean mask, True for valid tracks.
 
         Returns:
-            per_event_loss: (B,) reconstruction loss per event.
+            per_event_loss: (B,) feature reconstruction loss per event.
         """
         # Step 1: Create random visible/masked split
         visible_mask, masked_mask = self._create_random_mask(mask)
@@ -429,18 +436,17 @@ class MaskedTrackPretrainer(nn.Module):
         masked_true_features = self._gather_masked_tracks(
             features, masked_mask, max_masked
         )  # (B, input_dim, max_masked)
-        masked_true_lorentz_vectors = self._gather_masked_tracks(
-            lorentz_vectors, masked_mask, max_masked
-        )  # (B, 4, max_masked)
 
-        # Step 4: Decode masked tracks
-        predicted_features, predicted_lorentz_vectors = self.decoder(
+        # Step 4: Decode masked tracks (features only)
+        predicted_features = self.decoder(
             backbone_tokens, masked_coordinates, max_masked
-        )
+        )  # (B, num_output_features, max_masked)
 
-        # Step 5: Compute reconstruction loss per event
-        # L = λ_feat × MSE(pred_features, true_features)
-        #   + λ_lv  × MSE(pred_4vector, true_4vector)
+        # Step 5: Compute feature reconstruction loss per event
+        # L = (1 / N_masked) × Σ_i Σ_f (pred_f_i - true_f_i)²
+        #
+        # Features are already standardized (clipped to [-5, 5]) by weaver,
+        # so MSE is well-scaled across all feature channels.
 
         # Per-track valid mask for the gathered dense tensor
         # (some events may have fewer masked tracks than max_masked)
@@ -451,28 +457,13 @@ class MaskedTrackPretrainer(nn.Module):
         for batch_idx in range(features.shape[0]):
             track_valid[batch_idx, :, :num_masked_per_event[batch_idx]] = 1.0
 
-        # Feature reconstruction loss: MSE per track, averaged over valid
+        # MSE on weaver-standardized features, averaged per event
         feature_error = (
             (predicted_features - masked_true_features).square() * track_valid
         )  # (B, num_features, max_masked)
-        feature_loss = feature_error.sum(dim=(1, 2)) / (
+        per_event_loss = feature_error.sum(dim=(1, 2)) / (
             num_masked_per_event.float() * features.shape[1]
         ).clamp(min=1.0)  # (B,)
-
-        # 4-vector reconstruction loss
-        lorentz_vector_error = (
-            (predicted_lorentz_vectors - masked_true_lorentz_vectors).square()
-            * track_valid
-        )  # (B, 4, max_masked)
-        lorentz_vector_loss = lorentz_vector_error.sum(dim=(1, 2)) / (
-            num_masked_per_event.float() * 4
-        ).clamp(min=1.0)  # (B,)
-
-        # Combined loss per event
-        per_event_loss = (
-            self.loss_weight_features * feature_loss
-            + self.loss_weight_lorentz_vectors * lorentz_vector_loss
-        )  # (B,)
 
         return per_event_loss
 
