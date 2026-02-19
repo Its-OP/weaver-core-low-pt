@@ -8,7 +8,7 @@
 # =============================================================================
 set -euo pipefail
 
-BRANCH="${1:-master}"
+BRANCH="${1:-main}"
 
 echo "Pulling branch '${BRANCH}' for weaver..."
 git fetch origin
