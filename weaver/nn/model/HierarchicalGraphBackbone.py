@@ -135,11 +135,17 @@ def cross_set_knn(
     reference_coordinates: torch.Tensor,
     num_neighbors: int,
     reference_mask: torch.Tensor | None = None,
+    query_reference_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-set k-Nearest Neighbors in (η, φ) space with phi wrapping.
 
     Computes distances between M query points and P reference points,
     returns the K nearest reference points for each query.
+
+    When query points are a subset of reference points (e.g. FPS centroids),
+    pass query_reference_indices to exclude self-matches. This prevents
+    ΔR=0 pairs which cause NaN in downstream log/sqrt operations
+    (pairwise_lv_fts computes ln ΔR, ln m², etc.).
 
     Args:
         query_coordinates: (B, 2, M) query centroids in (η, φ).
@@ -147,6 +153,8 @@ def cross_set_knn(
         num_neighbors: K — neighbors per query.
         reference_mask: (B, 1, P) boolean mask for reference points,
             True for valid. If None, all points are considered valid.
+        query_reference_indices: (B, M) index of each query in the reference
+            set. If provided, self-matches are excluded from the results.
 
     Returns:
         neighbor_indices: (B, M, K) indices into the P dimension, dtype=long.
@@ -169,6 +177,18 @@ def cross_set_knn(
     if reference_mask is not None:
         invalid_mask = ~reference_mask.bool()  # (B, 1, P)
         distances = distances.masked_fill(invalid_mask, float('inf'))
+
+    # Exclude self-matches: set distance to inf where query_m == reference_p
+    if query_reference_indices is not None:
+        # query_reference_indices: (B, M) → build (B, M, P) mask where
+        # self_mask[b, m, p] = True iff p == query_reference_indices[b, m]
+        batch_size, num_queries, num_reference = distances.shape
+        self_indices = query_reference_indices.unsqueeze(-1)  # (B, M, 1)
+        reference_range = torch.arange(
+            num_reference, device=distances.device
+        ).view(1, 1, -1)  # (1, 1, P)
+        self_mask = (reference_range == self_indices)  # (B, M, P)
+        distances = distances.masked_fill(self_mask, float('inf'))
 
     # Select K nearest neighbors (smallest distances)
     neighbor_indices = distances.topk(
@@ -243,21 +263,23 @@ def build_cross_set_edge_features(
     # Pairwise Lorentz-vector features: (B, 4, M, K)
     # pairwise_lv_fts expects (B, 4, ...) and works on any trailing dims.
     # Computes: ln kT, ln z, ln ΔR, ln m²
+    #
+    # Self-matches (centroid with itself) are excluded at the kNN stage,
+    # so ΔR > 0 is guaranteed for all pairs. However, pairwise_lv_fts
+    # still contains log/sqrt operations that lose precision in float16
+    # (e.g. ln m² for nearly collinear pairs). Force float32 for safety.
     center_lv_expanded = center_lorentz_vectors.unsqueeze(-1).expand_as(
         neighbor_lorentz_vectors
     )
-    # pairwise_lv_fts internally computes ΔR = sqrt(ΔR²), which has
-    # undefined gradient when ΔR²=0 (centroid is its own kNN neighbor).
-    # Add tiny noise to neighbor LVs to break exact equality and prevent
-    # sqrt(0) in the backward pass. The noise magnitude (1e-6) is negligible
-    # compared to physical momenta (O(0.1-10 GeV)).
-    neighbor_lv_perturbed = neighbor_lorentz_vectors + torch.randn_like(
-        neighbor_lorentz_vectors
-    ) * 1e-6
+    with torch.amp.autocast('cuda', enabled=False):
+        lv_features = pairwise_lv_fts(
+            center_lv_expanded.float(),
+            neighbor_lorentz_vectors.float(),
+            num_outputs=4,
+        )  # (B, 4, M, K), float32
 
-    lv_features = pairwise_lv_fts(
-        center_lv_expanded, neighbor_lv_perturbed, num_outputs=4
-    )  # (B, 4, M, K)
+    # Cast back to input dtype for downstream layers
+    lv_features = lv_features.to(center_features.dtype)
 
     # Concatenate: [center, neighbor − center, pairwise_lv_fts]
     # → (B, 2*C + 4, M, K)
@@ -371,9 +393,12 @@ class SetAbstractionStage(nn.Module):
         )  # (B, 4, P_out)
 
         # Step 2: Cross-set kNN — find K nearest reference points per centroid
-        # kNN operates in 2D (η, φ) space, not in feature space
+        # kNN operates in 2D (η, φ) space, not in feature space.
+        # Exclude self-matches (centroid with itself at ΔR=0) to avoid
+        # NaN in pairwise_lv_fts (which computes ln ΔR, ln m², etc.).
         neighbor_indices = cross_set_knn(
-            centroid_coordinates, coordinates, self.num_neighbors, mask
+            centroid_coordinates, coordinates, self.num_neighbors, mask,
+            query_reference_indices=centroid_indices,
         )  # (B, P_out, K)
 
         # Step 3: Gather neighbor features and 4-vectors from input tensors
