@@ -307,10 +307,11 @@ class SetAbstractionStage(nn.Module):
                            pairwise_lv_fts(center_lv, neighbor_lv)]
         4. EdgeConv MLP processes edges → messages  (B, C_out, P_out, K)
         5. Attention aggregation over K neighbors → (B, C_out, P_out)
-        6. 4-vector propagation: attention_weights @ neighbor_lvs → (B, 4, P_out)
-
-    No within-stage residual: P_in ≠ P_out and C_in ≠ C_out, so a shortcut
-    connection is not applicable. This matches PointNet++'s original design.
+        6. Residual: output = ReLU(EdgeConv_output + shortcut(centroid_features))
+           Shortcut projects C_in → C_out via Conv1d + BN (following ParticleNet).
+           Centroid features are gathered at FPS indices, so they already have
+           P_out spatial dimension — no spatial pooling needed.
+        7. 4-vector propagation: attention_weights @ neighbor_lvs → (B, 4, P_out)
 
     Args:
         input_channels: C_in — feature channels of input points.
@@ -334,14 +335,26 @@ class SetAbstractionStage(nn.Module):
         edge_feature_dim = 2 * input_channels + 4
 
         # EdgeConv MLP: two Conv2d layers operating on (B, C, M, K)
+        # Note: NO ReLU after the last BN — ReLU is applied after residual addition
+        # (standard post-addition activation, as in ResNet / ParticleNet).
         self.edge_convolution = nn.Sequential(
             nn.Conv2d(edge_feature_dim, output_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(output_channels),
             nn.ReLU(),
             nn.Conv2d(output_channels, output_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(output_channels),
-            nn.ReLU(),
         )
+
+        # Residual shortcut: projects centroid features from C_in → C_out.
+        # Centroid features are gathered at FPS indices, already at P_out points.
+        # Conv1d(kernel=1) + BN matches ParticleNet's shortcut design.
+        self.residual_shortcut = nn.Sequential(
+            nn.Conv1d(input_channels, output_channels, kernel_size=1, bias=False),
+            nn.BatchNorm1d(output_channels),
+        )
+
+        # Post-residual activation
+        self.activation = nn.ReLU()
 
         # Attention scoring: Conv2d(C_out → 1, kernel=1)
         # Produces per-neighbor attention logits for weighted aggregation
@@ -437,9 +450,15 @@ class SetAbstractionStage(nn.Module):
         attention_weights = attention_weights.nan_to_num(0.0)
 
         # Weighted sum: (B, C_out, P_out, K) × (B, 1, P_out, K) → sum → (B, C_out, P_out)
-        output_features = (attention_weights * messages).sum(dim=-1)
+        aggregated_features = (attention_weights * messages).sum(dim=-1)
 
-        # Step 6: 4-vector propagation via attention weights
+        # Step 6: Residual connection
+        # shortcut(centroid_features): (B, C_in, P_out) → (B, C_out, P_out)
+        # output = ReLU(aggregated + shortcut)
+        shortcut = self.residual_shortcut(centroid_features)
+        output_features = self.activation(aggregated_features + shortcut)
+
+        # Step 7: 4-vector propagation via attention weights
         # (B, 1, P_out, K) × (B, 4, P_out, K) → sum → (B, 4, P_out)
         output_lorentz_vectors = (
             attention_weights * neighbor_lorentz_vectors
