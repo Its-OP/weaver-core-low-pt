@@ -265,16 +265,24 @@ def build_cross_set_edge_features(
     # Computes: ln kT, ln z, ln ΔR, ln m²
     #
     # Self-matches (centroid with itself) are excluded at the kNN stage,
-    # so ΔR > 0 is guaranteed for all pairs. However, pairwise_lv_fts
-    # still contains log/sqrt operations that lose precision in float16
-    # (e.g. ln m² for nearly collinear pairs). Force float32 for safety.
+    # so ΔR > 0 for distinct particles. However, pairwise_lv_fts computes
+    # sqrt(ΔR²) whose backward gradient is 1/(2·sqrt(x)) → ∞ as x → 0.
+    # Even with distinct particles, nearly collinear tracks can have tiny ΔR.
+    # The forward pass is fine (sqrt(0) = 0), but the backward produces NaN.
+    #
+    # Fix: detach the pairwise LV features from the computation graph.
+    # These features (ln kT, ln z, ln ΔR, ln m²) serve as physics-informed
+    # edge descriptors — they don't need gradients to flow back through
+    # the 4-vectors. The backbone learns through the EdgeConv MLP and
+    # the feature aggregation path, not through the LV feature computation.
+    # Force float32 to avoid precision loss in log/sqrt operations.
     center_lv_expanded = center_lorentz_vectors.unsqueeze(-1).expand_as(
         neighbor_lorentz_vectors
     )
     with torch.amp.autocast('cuda', enabled=False):
         lv_features = pairwise_lv_fts(
-            center_lv_expanded.float(),
-            neighbor_lorentz_vectors.float(),
+            center_lv_expanded.detach().float(),
+            neighbor_lorentz_vectors.detach().float(),
             num_outputs=4,
         )  # (B, 4, M, K), float32
 
@@ -306,12 +314,18 @@ class SetAbstractionStage(nn.Module):
         3. Edge features: [center_feat, neighbor_feat − center_feat,
                            pairwise_lv_fts(center_lv, neighbor_lv)]
         4. EdgeConv MLP processes edges → messages  (B, C_out, P_out, K)
-        5. Attention aggregation over K neighbors → (B, C_out, P_out)
-        6. Residual: output = ReLU(EdgeConv_output + shortcut(centroid_features))
+        5. Max-pool aggregation over K neighbors → (B, C_out, P_out)
+           Max-pooling does per-channel selection: each of C_out channels
+           independently picks its strongest-activating neighbor. This
+           preserves local structure far better than attention-weighted mean
+           (which uses a single scalar weight shared across all channels).
+        6. Residual: output = ReLU(max_pool_output + shortcut(centroid_features))
            Shortcut projects C_in → C_out via Conv1d + BN (following ParticleNet).
            Centroid features are gathered at FPS indices, so they already have
            P_out spatial dimension — no spatial pooling needed.
         7. 4-vector propagation: attention_weights @ neighbor_lvs → (B, 4, P_out)
+           Attention is kept for 4-vectors because convex combination (softmax
+           weights summing to 1) preserves physical meaning of momenta.
 
     Args:
         input_channels: C_in — feature channels of input points.
@@ -356,9 +370,11 @@ class SetAbstractionStage(nn.Module):
         # Post-residual activation
         self.activation = nn.ReLU()
 
-        # Attention scoring: Conv2d(C_out → 1, kernel=1)
-        # Produces per-neighbor attention logits for weighted aggregation
-        self.attention_scorer = nn.Conv2d(
+        # Attention scoring for 4-vector propagation only.
+        # 4-vectors must be aggregated as convex combinations (softmax → weights
+        # sum to 1) to preserve physical meaning of momenta. Feature aggregation
+        # uses max-pooling instead (per-channel selection, no shared scalar weight).
+        self.lorentz_vector_attention_scorer = nn.Conv2d(
             output_channels, 1, kernel_size=1, bias=False
         )
 
@@ -432,36 +448,45 @@ class SetAbstractionStage(nn.Module):
         # Step 4: EdgeConv MLP → messages (B, C_out, P_out, K)
         messages = self.edge_convolution(edge_features)
 
-        # Step 5: Attention aggregation over K neighbors
-        # attention_logits: (B, 1, P_out, K)
-        attention_logits = self.attention_scorer(messages)
-
-        # Mask invalid neighbors: gather reference mask for each neighbor
+        # Step 5a: Max-pool aggregation for features
+        # Per-channel max over K neighbors: each of C_out channels independently
+        # picks its strongest-activating neighbor. This preserves local structure
+        # (DGCNN/ParticleNet design) unlike attention-weighted mean which uses a
+        # single scalar weight shared across all channels.
+        #
+        # Mask invalid neighbors before max-pool: set to -inf so they can't win
         neighbor_mask = cross_set_gather(
             mask.float(), neighbor_indices
         )  # (B, 1, P_out, K)
-        attention_logits = attention_logits.masked_fill(
-            neighbor_mask == 0, float('-inf')
+        messages_masked = messages.masked_fill(neighbor_mask == 0, float('-inf'))
+        aggregated_features = messages_masked.max(dim=-1)[0]  # (B, C_out, P_out)
+        # Handle all-masked case: replace -inf with 0
+        aggregated_features = aggregated_features.nan_to_num(0.0)
+        aggregated_features = aggregated_features.masked_fill(
+            aggregated_features == float('-inf'), 0.0
         )
-
-        # Softmax over K neighbors: (B, 1, P_out, K)
-        attention_weights = torch.softmax(attention_logits, dim=-1)
-        # Handle all-masked case: replace NaN from softmax(-inf) with 0
-        attention_weights = attention_weights.nan_to_num(0.0)
-
-        # Weighted sum: (B, C_out, P_out, K) × (B, 1, P_out, K) → sum → (B, C_out, P_out)
-        aggregated_features = (attention_weights * messages).sum(dim=-1)
 
         # Step 6: Residual connection
         # shortcut(centroid_features): (B, C_in, P_out) → (B, C_out, P_out)
-        # output = ReLU(aggregated + shortcut)
+        # output = ReLU(max_pool + shortcut)
         shortcut = self.residual_shortcut(centroid_features)
         output_features = self.activation(aggregated_features + shortcut)
+
+        # Step 5b: Attention-weighted aggregation for 4-vectors only
+        # 4-vectors must be aggregated as convex combinations (softmax weights
+        # sum to 1) to preserve physical meaning: the aggregated 4-vector
+        # represents the total momentum of the local neighborhood.
+        lv_attention_logits = self.lorentz_vector_attention_scorer(messages)
+        lv_attention_logits = lv_attention_logits.masked_fill(
+            neighbor_mask == 0, float('-inf')
+        )
+        lv_attention_weights = torch.softmax(lv_attention_logits, dim=-1)
+        lv_attention_weights = lv_attention_weights.nan_to_num(0.0)
 
         # Step 7: 4-vector propagation via attention weights
         # (B, 1, P_out, K) × (B, 4, P_out, K) → sum → (B, 4, P_out)
         output_lorentz_vectors = (
-            attention_weights * neighbor_lorentz_vectors
+            lv_attention_weights * neighbor_lorentz_vectors
         ).sum(dim=-1)
 
         # Output mask: all centroids are valid (FPS only selects valid points)
