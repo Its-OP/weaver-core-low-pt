@@ -374,8 +374,10 @@ class EnrichCompactBackbone(nn.Module):
         #   1. pairwise_lv_fts() has NaN gradients from sqrt(ΔR²) near zero
         #   2. kNN topology should be fixed (not learned) for stability
         with torch.no_grad():
-            # Push padded points far away so kNN never selects them
-            points_for_knn = points.clone()
+            # Push padded points far away so kNN never selects them.
+            # Force fp32 to avoid overflow if AMP casts inputs to fp16
+            # (fp16 max ≈ 65504, so 1e9 would overflow).
+            points_for_knn = points.clone().float()
             points_for_knn.masked_fill_(null_positions, 1e9)
             # During training, add random shift to padded points to break
             # ties (prevents numerical coincidences among padded points)

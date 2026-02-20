@@ -409,7 +409,10 @@ class MultiScaleEdgeConv(nn.Module):
                 pts_out = pts_out + (coords_weights * rel_coords).sum(-1)
 
             if 'attn' in self.edge_aggregation:
-                attn = masked(self.sa[i](msg), -1e9)
+                # Use -65000 instead of -1e9 for AMP fp16 compatibility:
+                # fp16 max ≈ 65504, so -1e9 overflows. -65000 is safely
+                # representable and still drives softmax output to ≈0.
+                attn = masked(self.sa[i](msg), -65000.0)
                 attn = attn.softmax(dim=-1)
                 if self.sa_repeat is not None:
                     attn = attn.repeat(1, self.sa_repeat, 1, 1)
@@ -429,7 +432,7 @@ class MultiScaleEdgeConv(nn.Module):
             node_inputs.append(fts)
 
             if self.lv_aggregation:
-                attn = masked(self.lv_sa[i](msg), -1e9)
+                attn = masked(self.lv_sa[i](msg), -65000.0)
                 attn = attn.softmax(dim=-1)
                 lvs_agg = (attn * lvs_ngbs[:, :, :, s]).sum(-1, keepdim=True)
                 lvs = [to_pt2(lvs_agg).log(), to_m2(lvs_agg).log()]
