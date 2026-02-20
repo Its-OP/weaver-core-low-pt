@@ -1,10 +1,17 @@
 """Masked Track Reconstruction for Backbone Pretraining.
 
-Self-supervised pretraining via masked track reconstruction:
-    1. Randomly mask 40% of input tracks
-    2. Encode visible tracks through HierarchicalGraphBackbone → 64 tokens
-    3. Decode masked tracks via cross-attention to backbone tokens
-    4. Reconstruct masked track features (standardized by weaver's pipeline)
+Self-supervised pretraining via masked track reconstruction with the
+two-stage Enrich-Compact backbone:
+    1. Enrich ALL tracks with neighbor context (ParticleNeXt-style)
+    2. Randomly mask 40% of tracks
+    3. Densely pack visible enriched tracks → compact via PointNet++
+    4. Decode masked tracks via cross-attention to backbone tokens
+    5. Reconstruct original 7 raw features (standardized by weaver)
+
+Masking happens BETWEEN enrichment and compaction. This way, visible
+tracks carry partial information about masked neighbors from the
+enrichment message passing — making reconstruction solvable but
+not trivial (the decoder can't just copy).
 
 The decoder is discarded after pretraining. Only the backbone is kept.
 
@@ -29,7 +36,7 @@ Design note on decoder simplicity:
 import torch
 import torch.nn as nn
 
-from weaver.nn.model.HierarchicalGraphBackbone import HierarchicalGraphBackbone
+from weaver.nn.model.EnrichCompactBackbone import EnrichCompactBackbone
 
 
 class MaskedTrackDecoder(nn.Module):
@@ -198,28 +205,32 @@ class MaskedTrackDecoder(nn.Module):
 
 
 class MaskedTrackPretrainer(nn.Module):
-    """Wrapper combining masking + backbone + decoder for pretraining.
+    """Wrapper combining enrichment + masking + compaction + decoder.
 
-    Performs masked track reconstruction:
-        1. Randomly mask a fraction of input tracks
-        2. Encode visible tracks through backbone
-        3. Decode masked tracks via cross-attention
-        4. Compute feature reconstruction loss (MSE) on masked tracks
+    Two-stage pretraining forward flow:
+        1. ENRICH: All tracks → ParticleNeXt MultiScaleEdgeConv → (B, 256, P)
+        2. MASK: Randomly select 40% of valid tracks to mask
+        3. GATHER VISIBLE: Densely pack visible enriched tracks (FPS needs
+           contiguous valid points — can't just zero out masked tracks)
+        4. COMPACT: Visible tracks → PointNet++ set abstraction → 128 tokens
+        5. GATHER GT: Densely pack ground truth raw features for masked tracks
+        6. DECODE: Cross-attention from query embeddings to backbone tokens
+        7. LOSS: MSE between predicted and true raw 7 features
 
-    Only features (pf_features) are reconstructed — not 4-vectors, because
-    pf_vectors (px, py, pz, E) are fully derivable from pf_features (which
-    already contain px, py, pz). Reconstructing them would add no new
-    learning signal.
+    Masking between enrichment and compaction means:
+        - Visible tracks carry partial info about masked neighbors (from
+          enrichment message passing) — the reconstruction target is solvable
+        - But the decoder can't just copy — it must decode from compressed
+          backbone tokens, forcing the backbone to learn useful representations
 
     Features arrive already standardized by weaver's data pipeline
     (preprocess.method: auto → median-centering + IQR scaling + clipping
     to [-5, 5]), so the MSE loss is naturally well-scaled.
 
-    Returns per-event loss tensor (B,) for integration with weaver's
-    train_regression mode.
+    Returns per-event loss tensor (B,) for the custom training script.
 
     Args:
-        backbone_kwargs: Keyword arguments for HierarchicalGraphBackbone.
+        backbone_kwargs: Keyword arguments for EnrichCompactBackbone.
         decoder_kwargs: Keyword arguments for MaskedTrackDecoder.
         mask_ratio: Fraction of tracks to mask (default: 0.4).
     """
@@ -239,7 +250,7 @@ class MaskedTrackPretrainer(nn.Module):
 
         self.mask_ratio = mask_ratio
 
-        self.backbone = HierarchicalGraphBackbone(**backbone_kwargs)
+        self.backbone = EnrichCompactBackbone(**backbone_kwargs)
 
         # Set decoder backbone_dim to match backbone output
         decoder_kwargs.setdefault('backbone_dim', self.backbone.output_dim)
@@ -296,40 +307,58 @@ class MaskedTrackPretrainer(nn.Module):
             is_masked.unsqueeze(1),   # (B, 1, P)
         )
 
-    def _gather_masked_tracks(
-        self,
+    @staticmethod
+    def _gather_tracks(
         tensor: torch.Tensor,
-        masked_mask: torch.Tensor,
-        max_masked: int,
-    ) -> torch.Tensor:
-        """Gather masked track data into a dense tensor.
+        selection_mask: torch.Tensor,
+        max_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Densely pack selected tracks into a contiguous tensor.
+
+        Used for both visible tracks (before compaction) and masked tracks
+        (ground truth for loss). Dense packing is required because FPS in
+        CompactionStage operates on coordinates — zeroed-out masked tracks
+        at coordinate (0, 0) would be selected as centroids, corrupting
+        the spatial downsampling.
 
         Args:
             tensor: (B, C, P) input tensor.
-            masked_mask: (B, 1, P) boolean mask for masked tracks.
-            max_masked: Maximum number of masked tracks across the batch.
+            selection_mask: (B, 1, P) boolean mask, True for selected tracks.
+            max_count: Maximum number of selected tracks across the batch.
 
         Returns:
-            gathered: (B, C, max_masked) dense tensor of masked track data.
+            Tuple of:
+                gathered: (B, C, max_count) dense tensor of selected tracks.
+                    Positions beyond per-event count are zero-padded.
+                validity_mask: (B, 1, max_count) boolean mask, True for valid
+                    slots (False for zero-padding at the end).
         """
         batch_size, num_channels, _ = tensor.shape
         device = tensor.device
 
-        masked_flat = masked_mask.squeeze(1)  # (B, P)
+        selection_flat = selection_mask.squeeze(1)  # (B, P)
 
         gathered = torch.zeros(
-            batch_size, num_channels, max_masked,
+            batch_size, num_channels, max_count,
             device=device, dtype=tensor.dtype,
         )
+        validity_mask = torch.zeros(
+            batch_size, 1, max_count,
+            device=device, dtype=torch.bool,
+        )
+
         for batch_idx in range(batch_size):
-            indices = masked_flat[batch_idx].nonzero(as_tuple=False).squeeze(-1)
-            num_masked = indices.numel()
-            if num_masked > 0:
-                gathered[batch_idx, :, :num_masked] = tensor[
+            indices = selection_flat[batch_idx].nonzero(
+                as_tuple=False
+            ).squeeze(-1)
+            count = indices.numel()
+            if count > 0:
+                gathered[batch_idx, :, :count] = tensor[
                     batch_idx, :, indices
                 ]
+                validity_mask[batch_idx, :, :count] = True
 
-        return gathered
+        return gathered, validity_mask
 
     def forward(
         self,
@@ -338,16 +367,25 @@ class MaskedTrackPretrainer(nn.Module):
         lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward pass: mask → encode → decode → compute feature MSE loss.
+        """Forward pass: enrich → mask → compact → decode → loss.
+
+        Flow:
+            1. ENRICH all tracks (ParticleNeXt MultiScaleEdgeConv)
+            2. MASK 40% of valid tracks
+            3. GATHER visible enriched tracks into dense tensor
+            4. COMPACT visible tracks (PointNet++ set abstraction → 128 tokens)
+            5. GATHER ground truth raw features for masked tracks
+            6. DECODE masked tracks from backbone tokens
+            7. LOSS: MSE on raw 7 features
 
         Features (pf_features) arrive already standardized by weaver's data
         pipeline (preprocess.method: auto → median-centering + IQR scaling
         + clipping to [-5, 5]). The decoder reconstructs these standardized
         values, and the MSE loss is naturally well-scaled.
 
-        4-vectors (pf_vectors) arrive raw — the backbone needs raw momenta
-        for pairwise_lv_fts(). They are NOT reconstructed because they are
-        fully derivable from the features (which contain px, py, pz).
+        4-vectors (pf_vectors) arrive raw — the enrichment stage needs raw
+        momenta for pairwise_lv_fts(). They are NOT reconstructed because
+        they are fully derivable from the features (which contain px, py, pz).
 
         Args:
             points: (B, 2, P) coordinates in (η, φ).
@@ -358,66 +396,76 @@ class MaskedTrackPretrainer(nn.Module):
         Returns:
             per_event_loss: (B,) feature reconstruction loss per event.
         """
-        # Step 1: Create random visible/masked split
+        batch_size = features.shape[0]
+        num_features = features.shape[1]
+
+        # Step 1: ENRICH all tracks with neighbor context
+        # All tracks participate — no masking yet. Each track accumulates
+        # information from its kNN neighborhood via MultiScaleEdgeConv.
+        enriched_features = self.backbone.enrich(
+            points, features, lorentz_vectors, mask,
+        )  # (B, enrichment_output_dim, P)
+
+        # Step 2: MASK — create random visible/masked split
         visible_mask, masked_mask = self._create_random_mask(mask)
 
-        # Count masked tracks per event for gathering
+        # Count per event
+        num_visible_per_event = visible_mask.squeeze(1).sum(dim=1)  # (B,)
         num_masked_per_event = masked_mask.squeeze(1).sum(dim=1)  # (B,)
+        max_visible = num_visible_per_event.max().item()
         max_masked = num_masked_per_event.max().item()
 
         if max_masked == 0:
             # Edge case: no tracks to mask
             return torch.zeros(
-                features.shape[0], device=features.device, dtype=features.dtype
+                batch_size, device=features.device, dtype=features.dtype
             )
 
-        # Step 2: Encode visible tracks through backbone
-        # Zero out masked tracks so they don't influence the backbone
-        visible_features = features * visible_mask.float()
-        visible_lorentz_vectors = lorentz_vectors * visible_mask.float()
-        visible_points = points * visible_mask.float()
+        # Step 3: GATHER visible enriched tracks into dense tensors
+        # Dense packing is required because FPS in CompactionStage operates
+        # on coordinates — zeroed-out masked tracks at (0, 0) would be
+        # selected as centroids, corrupting the spatial downsampling.
+        visible_enriched, visible_validity = self._gather_tracks(
+            enriched_features, visible_mask, max_visible,
+        )  # (B, enrichment_dim, max_visible), (B, 1, max_visible)
 
-        backbone_tokens, _, _ = self.backbone(
-            visible_points, visible_features, visible_lorentz_vectors,
-            visible_mask.float(),
-        )  # (B, C_backbone, M)
+        visible_coordinates, _ = self._gather_tracks(
+            points, visible_mask, max_visible,
+        )  # (B, 2, max_visible), _
 
-        # Step 3: Gather ground truth for masked tracks
-        masked_true_features = self._gather_masked_tracks(
-            features, masked_mask, max_masked
-        )  # (B, input_dim, max_masked)
+        # Step 4: COMPACT visible tracks → dense backbone tokens
+        backbone_tokens, _ = self.backbone.compact(
+            visible_coordinates, visible_enriched, visible_validity,
+        )  # (B, output_dim, M)
 
-        # Step 4: Decode masked tracks (features only)
+        # Step 5: GATHER ground truth raw features for masked tracks
+        # Target is raw 7-feature standardized input (not enriched features):
+        # stable, physically meaningful, interpretable loss.
+        masked_true_features, masked_validity = self._gather_tracks(
+            features, masked_mask, max_masked,
+        )  # (B, input_dim, max_masked), (B, 1, max_masked)
+
+        # Step 6: DECODE masked tracks from backbone tokens
         # The decoder receives only backbone tokens and the count of masked
         # tracks. No (η, φ) coordinates — this prevents the decoder from
         # bypassing the backbone via spatial shortcuts.
         predicted_features = self.decoder(
-            backbone_tokens, max_masked
+            backbone_tokens, max_masked,
         )  # (B, num_output_features, max_masked)
 
-        # Step 5: Compute feature reconstruction loss per event
+        # Step 7: Compute feature reconstruction loss per event
         # L = (1 / N_masked) × Σ_i Σ_f (pred_f_i - true_f_i)²
         #
         # Features are already standardized (clipped to [-5, 5]) by weaver,
         # so MSE is well-scaled across all feature channels.
+        # Use the validity mask to exclude zero-padded slots.
+        track_valid = masked_validity.float()  # (B, 1, max_masked)
 
-        # Per-track valid mask for the gathered dense tensor
-        # (some events may have fewer masked tracks than max_masked)
-        track_valid = torch.zeros(
-            features.shape[0], 1, max_masked,
-            device=features.device, dtype=features.dtype,
-        )
-        for batch_idx in range(features.shape[0]):
-            track_valid[batch_idx, :, :num_masked_per_event[batch_idx]] = 1.0
-
-        # MSE on weaver-standardized features, averaged per event
         feature_error = (
             (predicted_features - masked_true_features).square() * track_valid
         )  # (B, num_features, max_masked)
         per_event_loss = feature_error.sum(dim=(1, 2)) / (
-            num_masked_per_event.float() * features.shape[1]
+            num_masked_per_event.float() * num_features
         ).clamp(min=1.0)  # (B,)
 
         return per_event_loss
-
-
