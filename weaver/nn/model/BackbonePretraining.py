@@ -40,9 +40,19 @@ class MaskedTrackDecoder(nn.Module):
     backbone tokens via cross-attention — it has no other source.
 
     Architecture:
-        1. Learnable index embeddings (physics-free query differentiation)
+        1. Learnable query embeddings (physics-free query differentiation)
         2. Cross-attention: masked track queries attend to backbone tokens
         3. Output MLP: project cross-attention output → predicted features
+
+    Why learnable query embeddings (not shared token + noise):
+        Each masked query needs a distinct embedding so that after W_Q
+        projection, different queries produce different attention patterns
+        over the 64 backbone tokens. A shared token + noise approach fails
+        because the noise gets attenuated through W_Q projection and
+        dot-product with keys: for decoder_dim=128 with 4 heads (d_head=32),
+        achieving O(1) logit variation would require noise_std ≈ 6 — large
+        enough to drown the token itself. Learnable embeddings avoid this
+        by having proper scale from the start (initialized at std=1/√d).
 
     Why no (η, φ) positional encoding:
         Sinusoidal PE from (η, φ) leaks spatial information into queries.
@@ -67,8 +77,9 @@ class MaskedTrackDecoder(nn.Module):
         decoder_dim: Internal dimension of the decoder (default: 128).
         num_heads: Number of cross-attention heads (default: 4).
         num_output_features: Number of track features to reconstruct (default: 7).
-        query_noise_std: Standard deviation of random noise added to the
-            [MASK] token to break symmetry between queries (default: 0.02).
+        max_masked_tracks: Maximum number of masked tracks (vocab size for
+            query embeddings). Must be >= mask_ratio × max_tracks_per_event.
+            Default: 1200 (supports 0.4 × 2800 = 1120 masked tracks).
         dropout: Dropout rate in cross-attention (default: 0.0).
     """
 
@@ -78,21 +89,35 @@ class MaskedTrackDecoder(nn.Module):
         decoder_dim: int = 128,
         num_heads: int = 4,
         num_output_features: int = 7,
-        query_noise_std: float = 0.02,
+        max_masked_tracks: int = 1200,
         dropout: float = 0.0,
     ):
         super().__init__()
         self.decoder_dim = decoder_dim
         self.num_output_features = num_output_features
-        self.query_noise_std = query_noise_std
 
-        # Learnable [MASK] token: shared by all masked queries.
-        # Small random noise is added at forward time to break symmetry
-        # so that cross-attention can produce different outputs per query.
-        # The noise carries zero physics information (it's i.i.d. Gaussian),
-        # unlike (η, φ) positional encoding which leaked spatial shortcuts.
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
-        nn.init.normal_(self.mask_token, std=0.02)
+        # Learnable query embeddings: one per masked-track slot.
+        # Each embedding is a distinct learned vector that produces a unique
+        # attention pattern over backbone tokens via W_Q projection.
+        #
+        # These embeddings carry zero physics information — they're just
+        # arbitrary slot indices (particle sets are permutation-invariant,
+        # so index 0 vs index 1 has no physical meaning). The only way for
+        # a query to produce a meaningful prediction is through cross-
+        # attention to backbone tokens.
+        self.query_embeddings = nn.Embedding(max_masked_tracks, decoder_dim)
+        nn.init.normal_(self.query_embeddings.weight, std=decoder_dim ** -0.5)
+
+        # LayerNorm on queries and keys before cross-attention.
+        # Attention logits = (Q·K^T)/√d_head require Q and K at comparable
+        # scales for non-degenerate softmax. Without normalization:
+        #   - At init: backbone output std ≈ 0.05, queries std ≈ 0.09
+        #     → logits ≈ 0 → uniform attention → no gradient signal
+        #   - After training: backbone output std ≈ 1.8, queries still ≈ 0.09
+        #     → logits dominated by key scale → queries ignored
+        # LayerNorm on both ensures O(1) logit variance from the start.
+        self.query_norm = nn.LayerNorm(decoder_dim)
+        self.memory_norm = nn.LayerNorm(decoder_dim)
 
         # Project backbone tokens to decoder dimension
         self.backbone_projection = nn.Linear(backbone_dim, decoder_dim)
@@ -135,21 +160,27 @@ class MaskedTrackDecoder(nn.Module):
         device = backbone_tokens.device
 
         # Project backbone tokens: (B, C_backbone, M) → (B, M, decoder_dim)
-        memory = self.backbone_projection(
-            backbone_tokens.transpose(1, 2)
+        # LayerNorm stabilizes key scale so attention logits are well-scaled
+        # regardless of backbone output magnitude (which changes over training).
+        memory = self.memory_norm(
+            self.backbone_projection(backbone_tokens.transpose(1, 2))
         )  # (B, M, decoder_dim)
 
-        # Build masked track queries: shared [MASK] token + random noise.
-        # All queries start from the same learnable embedding. Small i.i.d.
-        # Gaussian noise breaks symmetry so cross-attention can produce
-        # different outputs per query. The noise carries zero physics info.
-        # During eval, noise is still applied — the decoder must be robust
-        # to the specific noise realization, relying on backbone content.
-        queries = self.mask_token.expand(
-            batch_size, num_masked_tracks, -1
+        # Build masked track queries from learnable embeddings.
+        # Each query gets a unique learned vector (no physics info, just
+        # slot differentiation) that produces a distinct W_Q projection,
+        # yielding diverse attention patterns over backbone tokens.
+        # LayerNorm ensures query scale matches key scale for well-scaled
+        # attention logits from the start of training.
+        query_indices = torch.arange(
+            num_masked_tracks, device=device
+        )  # (N_masked,)
+        queries = self.query_norm(
+            self.query_embeddings(query_indices)
+        )  # (N_masked, decoder_dim)
+        queries = queries.unsqueeze(0).expand(
+            batch_size, -1, -1
         )  # (B, N_masked, decoder_dim)
-        noise = torch.randn_like(queries) * self.query_noise_std
-        queries = queries + noise
 
         # Cross-attention: each masked query independently attends to
         # backbone tokens. This is the sole information pathway from
