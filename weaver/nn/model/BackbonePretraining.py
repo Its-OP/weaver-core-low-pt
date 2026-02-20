@@ -66,11 +66,9 @@ class MaskedTrackDecoder(nn.Module):
         backbone_dim: Channel dimension of backbone tokens (default: 256).
         decoder_dim: Internal dimension of the decoder (default: 128).
         num_heads: Number of cross-attention heads (default: 4).
-        max_masked_tracks: Maximum number of masked tracks per event.
-            Sets the size of the learnable index embedding table.
-            Must be ≥ the actual number of masked tracks at runtime.
-            Default: 1200 (covers 40% of 2800 max tracks with margin).
         num_output_features: Number of track features to reconstruct (default: 7).
+        query_noise_std: Standard deviation of random noise added to the
+            [MASK] token to break symmetry between queries (default: 0.02).
         dropout: Dropout rate in cross-attention (default: 0.0).
     """
 
@@ -79,21 +77,22 @@ class MaskedTrackDecoder(nn.Module):
         backbone_dim: int = 256,
         decoder_dim: int = 128,
         num_heads: int = 4,
-        max_masked_tracks: int = 1200,
         num_output_features: int = 7,
+        query_noise_std: float = 0.02,
         dropout: float = 0.0,
     ):
         super().__init__()
         self.decoder_dim = decoder_dim
         self.num_output_features = num_output_features
+        self.query_noise_std = query_noise_std
 
-        # Learnable index embeddings: each masked query gets a unique embedding
-        # indexed by its position in the gathered dense tensor (0, 1, ..., N-1).
-        # These indices are arbitrary (the input set is unordered), so the
-        # embeddings carry zero spatial or physics information. They only serve
-        # to break the symmetry between otherwise-identical [MASK] queries.
-        # Shape: (max_masked_tracks, decoder_dim)
-        self.query_index_embedding = nn.Embedding(max_masked_tracks, decoder_dim)
+        # Learnable [MASK] token: shared by all masked queries.
+        # Small random noise is added at forward time to break symmetry
+        # so that cross-attention can produce different outputs per query.
+        # The noise carries zero physics information (it's i.i.d. Gaussian),
+        # unlike (η, φ) positional encoding which leaked spatial shortcuts.
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
 
         # Project backbone tokens to decoder dimension
         self.backbone_projection = nn.Linear(backbone_dim, decoder_dim)
@@ -140,18 +139,17 @@ class MaskedTrackDecoder(nn.Module):
             backbone_tokens.transpose(1, 2)
         )  # (B, M, decoder_dim)
 
-        # Build masked track queries from learnable index embeddings.
-        # indices: [0, 1, 2, ..., num_masked_tracks - 1]
-        # These are arbitrary ordinal positions in the gathered dense tensor,
-        # NOT physics-meaningful indices. The embedding only differentiates
-        # queries so cross-attention can produce different outputs per query.
-        query_indices = torch.arange(
-            num_masked_tracks, device=device
-        )  # (N_masked,)
-        queries = self.query_index_embedding(query_indices)  # (N_masked, D)
-        queries = queries.unsqueeze(0).expand(
-            batch_size, -1, -1
+        # Build masked track queries: shared [MASK] token + random noise.
+        # All queries start from the same learnable embedding. Small i.i.d.
+        # Gaussian noise breaks symmetry so cross-attention can produce
+        # different outputs per query. The noise carries zero physics info.
+        # During eval, noise is still applied — the decoder must be robust
+        # to the specific noise realization, relying on backbone content.
+        queries = self.mask_token.expand(
+            batch_size, num_masked_tracks, -1
         )  # (B, N_masked, decoder_dim)
+        noise = torch.randn_like(queries) * self.query_noise_std
+        queries = queries + noise
 
         # Cross-attention: each masked query independently attends to
         # backbone tokens. This is the sole information pathway from
