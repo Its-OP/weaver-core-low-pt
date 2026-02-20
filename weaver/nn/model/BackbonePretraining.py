@@ -321,6 +321,10 @@ class MaskedTrackPretrainer(nn.Module):
         at coordinate (0, 0) would be selected as centroids, corrupting
         the spatial downsampling.
 
+        Fully vectorized — no Python loops over the batch dimension.
+        Uses argsort on the inverted selection mask to push selected tracks
+        to the front of each row, then slices [:max_count].
+
         Args:
             tensor: (B, C, P) input tensor.
             selection_mask: (B, 1, P) boolean mask, True for selected tracks.
@@ -333,30 +337,42 @@ class MaskedTrackPretrainer(nn.Module):
                 validity_mask: (B, 1, max_count) boolean mask, True for valid
                     slots (False for zero-padding at the end).
         """
-        batch_size, num_channels, _ = tensor.shape
+        batch_size, num_channels, num_points = tensor.shape
         device = tensor.device
 
         selection_flat = selection_mask.squeeze(1)  # (B, P)
 
-        gathered = torch.zeros(
-            batch_size, num_channels, max_count,
-            device=device, dtype=tensor.dtype,
-        )
-        validity_mask = torch.zeros(
-            batch_size, 1, max_count,
-            device=device, dtype=torch.bool,
+        # Argsort trick: sort so selected (True=1) come first.
+        # ~selection_flat converts True→0, False→1; argsort puts 0s first.
+        # Within the selected group, original order is preserved (stable sort).
+        sorted_indices = (~selection_flat).long().argsort(
+            dim=1, stable=True
+        )  # (B, P)
+
+        # Take the first max_count indices per event
+        gather_indices = sorted_indices[:, :max_count]  # (B, max_count)
+
+        # Expand indices for gathering: (B, C, max_count)
+        gather_indices_expanded = gather_indices.unsqueeze(1).expand(
+            -1, num_channels, -1
         )
 
-        for batch_idx in range(batch_size):
-            indices = selection_flat[batch_idx].nonzero(
-                as_tuple=False
-            ).squeeze(-1)
-            count = indices.numel()
-            if count > 0:
-                gathered[batch_idx, :, :count] = tensor[
-                    batch_idx, :, indices
-                ]
-                validity_mask[batch_idx, :, :count] = True
+        # Gather features
+        gathered = tensor.gather(2, gather_indices_expanded)  # (B, C, max_count)
+
+        # Build validity mask: position j is valid if j < num_selected[b]
+        num_selected = selection_flat.sum(dim=1)  # (B,)
+        position_indices = torch.arange(
+            max_count, device=device
+        ).unsqueeze(0)  # (1, max_count)
+        validity_mask = (
+            position_indices < num_selected.unsqueeze(1)
+        ).unsqueeze(1)  # (B, 1, max_count)
+
+        # Zero out padding positions (gathered may contain garbage from
+        # unselected tracks that landed in the first max_count slots
+        # when num_selected < max_count)
+        gathered = gathered * validity_mask.float()
 
         return gathered, validity_mask
 

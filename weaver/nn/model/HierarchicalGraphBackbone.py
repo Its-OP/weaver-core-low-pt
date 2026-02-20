@@ -96,13 +96,10 @@ def farthest_point_sampling(
     )
 
     # Select the first centroid: pick a random valid point per event.
-    # Use the first valid point for deterministic behavior during inference.
-    # During training, randomness comes from data shuffling already.
-    for batch_idx in range(batch_size):
-        valid_positions = point_mask[batch_idx].nonzero(as_tuple=False).squeeze(-1)
-        if valid_positions.numel() > 0:
-            random_pos = torch.randint(valid_positions.numel(), (1,), device=device)
-            centroid_indices[batch_idx, 0] = valid_positions[random_pos]
+    # Vectorized: assign random scores to valid points, take argmax.
+    random_scores = torch.rand(batch_size, num_points, device=device)
+    random_scores.masked_fill_(~point_mask, -1.0)  # invalid → can't win
+    centroid_indices[:, 0] = random_scores.argmax(dim=1)
 
     for step in range(num_centroids):
         # Get coordinates of the newly selected centroid
