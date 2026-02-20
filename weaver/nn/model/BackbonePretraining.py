@@ -10,91 +10,52 @@ The decoder is discarded after pretraining. Only the backbone is kept.
 
 MaskedTrackPretrainer.forward() returns (B,) per-event loss tensor.
 The custom training script (pretrain_backbone.py) calls .mean().backward().
+
+Design note on decoder simplicity:
+    The decoder is intentionally minimal — just cross-attention + output MLP.
+    No self-attention among masked queries, no (η, φ) positional encoding.
+    This prevents the decoder from bypassing the backbone:
+
+    Problem: With (η, φ) PE + self-attention, the decoder can learn spatial
+    statistics (local density, typical momentum at a position) from the
+    masked queries alone, without needing the backbone. This causes the loss
+    to plateau at ~0.75 (the positional-encoding floor) with zero gradient
+    pressure on the backbone.
+
+    Fix: Learnable index embeddings (no physics info) differentiate queries,
+    and cross-attention is the ONLY way to access event-specific information.
+    This forces the backbone to encode useful representations.
 """
-import math
 import torch
 import torch.nn as nn
 
 from weaver.nn.model.HierarchicalGraphBackbone import HierarchicalGraphBackbone
 
 
-class PositionalEncoding2D(nn.Module):
-    """Sinusoidal positional encoding from (η, φ) coordinates.
-
-    Used only in the pretraining decoder to differentiate identical [MASK]
-    tokens — each masked track query needs to know *which* (η, φ) location
-    it should reconstruct. This does NOT break permutation invariance of
-    the backbone, which never uses positional encoding.
-
-    Encodes 2D spatial positions into a high-dimensional vector using
-    sinusoidal functions at different frequencies.
-
-    For each coordinate c ∈ {η, φ} and frequency index k:
-        PE(c, 2k)   = sin(c / 10000^(2k/d))
-        PE(c, 2k+1) = cos(c / 10000^(2k/d))
-
-    Total output dimension = encoding_dim (split equally between η and φ).
-
-    Args:
-        encoding_dim: Output dimension of the positional encoding.
-            Must be divisible by 4 (sin/cos for each of η and φ).
-    """
-
-    def __init__(self, encoding_dim: int):
-        super().__init__()
-        assert encoding_dim % 4 == 0, (
-            f"encoding_dim must be divisible by 4, got {encoding_dim}"
-        )
-        self.encoding_dim = encoding_dim
-        quarter_dim = encoding_dim // 4
-
-        # Frequency bands: 1 / 10000^(2k/d) for k = 0, ..., quarter_dim-1
-        frequencies = torch.exp(
-            torch.arange(quarter_dim, dtype=torch.float32)
-            * (-math.log(10000.0) / quarter_dim)
-        )
-        self.register_buffer('frequencies', frequencies)
-
-    def forward(self, coordinates: torch.Tensor) -> torch.Tensor:
-        """Encode (η, φ) coordinates into positional embeddings.
-
-        Args:
-            coordinates: (B, 2, N) where dim 1 is (η, φ).
-
-        Returns:
-            positional_encoding: (B, encoding_dim, N).
-        """
-        eta = coordinates[:, 0:1, :]  # (B, 1, N)
-        phi = coordinates[:, 1:2, :]  # (B, 1, N)
-
-        # frequencies: (quarter_dim,) → (1, quarter_dim, 1) for broadcasting
-        freq = self.frequencies.view(1, -1, 1)
-
-        # (B, 1, N) × (1, quarter_dim, 1) → (B, quarter_dim, N)
-        eta_enc = torch.cat([
-            torch.sin(eta * freq),
-            torch.cos(eta * freq),
-        ], dim=1)  # (B, half_dim, N)
-
-        phi_enc = torch.cat([
-            torch.sin(phi * freq),
-            torch.cos(phi * freq),
-        ], dim=1)  # (B, half_dim, N)
-
-        return torch.cat([eta_enc, phi_enc], dim=1)  # (B, encoding_dim, N)
-
-
 class MaskedTrackDecoder(nn.Module):
-    """Decoder for masked track reconstruction.
+    """Minimal decoder for masked track reconstruction.
 
-    Similar to MAE/Point-MAE decoders. Reconstructs per-track features
-    for masked tracks by cross-attending to backbone tokens.
+    Intentionally simple to prevent decoder shortcut / backbone bypass.
+    The decoder must extract ALL event-specific information from the
+    backbone tokens via cross-attention — it has no other source.
 
     Architecture:
-        1. Learnable [MASK] embedding + positional encoding from (η, φ)
+        1. Learnable index embeddings (physics-free query differentiation)
         2. Cross-attention: masked track queries attend to backbone tokens
-        3. Self-attention: N_layers among masked track queries
-        4. Output projection: Linear(decoder_dim → num_output_features)
+        3. Output MLP: project cross-attention output → predicted features
+
+    Why no (η, φ) positional encoding:
+        Sinusoidal PE from (η, φ) leaks spatial information into queries.
+        Combined with self-attention, this lets the decoder learn spatial
+        statistics (density, typical pT at a position) without the backbone.
+        Learnable index embeddings only differentiate queries — they carry
+        zero physics information since particle sets are permutation-invariant.
+
+    Why no self-attention among masked queries:
+        Self-attention lets ~450 masked queries exchange positional info,
+        creating an information pathway that bypasses the backbone entirely.
+        Without it, each query independently cross-attends to backbone
+        tokens, forcing the backbone to be the sole information source.
 
     Note: We only reconstruct pf_features (standardized by weaver), not
     pf_vectors (raw 4-momenta). The 4-vectors (px, py, pz, E) are fully
@@ -104,10 +65,13 @@ class MaskedTrackDecoder(nn.Module):
     Args:
         backbone_dim: Channel dimension of backbone tokens (default: 256).
         decoder_dim: Internal dimension of the decoder (default: 128).
-        num_heads: Number of attention heads (default: 4).
-        num_self_attention_layers: Number of self-attention layers (default: 2).
+        num_heads: Number of cross-attention heads (default: 4).
+        max_masked_tracks: Maximum number of masked tracks per event.
+            Sets the size of the learnable index embedding table.
+            Must be ≥ the actual number of masked tracks at runtime.
+            Default: 1200 (covers 40% of 2800 max tracks with margin).
         num_output_features: Number of track features to reconstruct (default: 7).
-        dropout: Dropout rate in attention layers (default: 0.0).
+        dropout: Dropout rate in cross-attention (default: 0.0).
     """
 
     def __init__(
@@ -115,7 +79,7 @@ class MaskedTrackDecoder(nn.Module):
         backbone_dim: int = 256,
         decoder_dim: int = 128,
         num_heads: int = 4,
-        num_self_attention_layers: int = 2,
+        max_masked_tracks: int = 1200,
         num_output_features: int = 7,
         dropout: float = 0.0,
     ):
@@ -123,17 +87,19 @@ class MaskedTrackDecoder(nn.Module):
         self.decoder_dim = decoder_dim
         self.num_output_features = num_output_features
 
-        # Learnable [MASK] token embedding
-        self.mask_token = nn.Parameter(torch.zeros(1, decoder_dim, 1))
-        nn.init.normal_(self.mask_token, std=0.02)
-
-        # Positional encoding from (η, φ) coordinates
-        self.positional_encoding = PositionalEncoding2D(decoder_dim)
+        # Learnable index embeddings: each masked query gets a unique embedding
+        # indexed by its position in the gathered dense tensor (0, 1, ..., N-1).
+        # These indices are arbitrary (the input set is unordered), so the
+        # embeddings carry zero spatial or physics information. They only serve
+        # to break the symmetry between otherwise-identical [MASK] queries.
+        # Shape: (max_masked_tracks, decoder_dim)
+        self.query_index_embedding = nn.Embedding(max_masked_tracks, decoder_dim)
 
         # Project backbone tokens to decoder dimension
         self.backbone_projection = nn.Linear(backbone_dim, decoder_dim)
 
-        # Cross-attention: masked queries attend to backbone tokens
+        # Cross-attention: masked queries attend to backbone tokens.
+        # This is the ONLY way event-specific information enters the decoder.
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=decoder_dim,
             num_heads=num_heads,
@@ -142,103 +108,61 @@ class MaskedTrackDecoder(nn.Module):
         )
         self.cross_attention_norm = nn.LayerNorm(decoder_dim)
 
-        # Self-attention layers among masked track queries
-        self.self_attention_layers = nn.ModuleList()
-        self.self_attention_norms = nn.ModuleList()
-        self.feedforward_layers = nn.ModuleList()
-        self.feedforward_norms = nn.ModuleList()
-        for _ in range(num_self_attention_layers):
-            self.self_attention_layers.append(
-                nn.MultiheadAttention(
-                    embed_dim=decoder_dim,
-                    num_heads=num_heads,
-                    dropout=dropout,
-                    batch_first=True,
-                )
-            )
-            self.self_attention_norms.append(nn.LayerNorm(decoder_dim))
-            self.feedforward_layers.append(nn.Sequential(
-                nn.Linear(decoder_dim, decoder_dim * 4),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(decoder_dim * 4, decoder_dim),
-                nn.Dropout(dropout),
-            ))
-            self.feedforward_norms.append(nn.LayerNorm(decoder_dim))
-
-        # Output projection: predict features per masked track
-        self.output_projection = nn.Linear(
-            decoder_dim, num_output_features
+        # Output MLP: cross-attention output → predicted features.
+        # One hidden layer with GELU provides enough capacity to decode
+        # backbone representations into 7 output features, without being
+        # so powerful that it can memorize patterns independently.
+        self.output_mlp = nn.Sequential(
+            nn.Linear(decoder_dim, decoder_dim),
+            nn.GELU(),
+            nn.Linear(decoder_dim, num_output_features),
         )
 
     def forward(
         self,
         backbone_tokens: torch.Tensor,
-        masked_track_coordinates: torch.Tensor,
         num_masked_tracks: int,
     ) -> torch.Tensor:
         """Decode masked tracks from backbone tokens.
 
         Args:
             backbone_tokens: (B, C_backbone, M) dense tokens from backbone.
-            masked_track_coordinates: (B, 2, N_masked) (η, φ) of masked tracks.
-            num_masked_tracks: N_masked — number of masked tracks per event.
+            num_masked_tracks: N_masked — number of masked tracks to predict.
 
         Returns:
             predicted_features: (B, num_output_features, N_masked)
         """
         batch_size = backbone_tokens.shape[0]
+        device = backbone_tokens.device
 
         # Project backbone tokens: (B, C_backbone, M) → (B, M, decoder_dim)
         memory = self.backbone_projection(
             backbone_tokens.transpose(1, 2)
         )  # (B, M, decoder_dim)
 
-        # Build masked track queries: [MASK] embedding + positional encoding
-        # mask_token: (1, decoder_dim, 1) → (B, decoder_dim, N_masked)
-        queries = self.mask_token.expand(
-            batch_size, -1, num_masked_tracks
-        )  # (B, decoder_dim, N_masked)
+        # Build masked track queries from learnable index embeddings.
+        # indices: [0, 1, 2, ..., num_masked_tracks - 1]
+        # These are arbitrary ordinal positions in the gathered dense tensor,
+        # NOT physics-meaningful indices. The embedding only differentiates
+        # queries so cross-attention can produce different outputs per query.
+        query_indices = torch.arange(
+            num_masked_tracks, device=device
+        )  # (N_masked,)
+        queries = self.query_index_embedding(query_indices)  # (N_masked, D)
+        queries = queries.unsqueeze(0).expand(
+            batch_size, -1, -1
+        )  # (B, N_masked, decoder_dim)
 
-        # Add positional encoding from masked track (η, φ) coordinates
-        position_encoding = self.positional_encoding(
-            masked_track_coordinates
-        )  # (B, decoder_dim, N_masked)
-        queries = queries + position_encoding
-
-        # Transpose to (B, N_masked, decoder_dim) for nn.MultiheadAttention
-        queries = queries.transpose(1, 2)  # (B, N_masked, decoder_dim)
-
-        # Cross-attention: masked queries attend to backbone tokens
+        # Cross-attention: each masked query independently attends to
+        # backbone tokens. This is the sole information pathway from
+        # the encoder — no self-attention, no positional encoding leak.
         cross_attention_output, _ = self.cross_attention(
             query=queries, key=memory, value=memory
         )
         queries = self.cross_attention_norm(queries + cross_attention_output)
 
-        # Self-attention layers
-        for (
-            self_attention,
-            self_attention_norm,
-            feedforward,
-            feedforward_norm,
-        ) in zip(
-            self.self_attention_layers,
-            self.self_attention_norms,
-            self.feedforward_layers,
-            self.feedforward_norms,
-        ):
-            # Self-attention with residual
-            self_attention_output, _ = self_attention(
-                query=queries, key=queries, value=queries
-            )
-            queries = self_attention_norm(queries + self_attention_output)
-
-            # Feedforward with residual
-            feedforward_output = feedforward(queries)
-            queries = feedforward_norm(queries + feedforward_output)
-
-        # Output projection: (B, N_masked, decoder_dim) → (B, N_masked, F)
-        predictions = self.output_projection(queries)
+        # Output MLP: (B, N_masked, decoder_dim) → (B, N_masked, F)
+        predictions = self.output_mlp(queries)
 
         # Transpose to (B, num_output_features, N_masked)
         return predictions.transpose(1, 2)
@@ -430,16 +354,16 @@ class MaskedTrackPretrainer(nn.Module):
         )  # (B, C_backbone, M)
 
         # Step 3: Gather ground truth for masked tracks
-        masked_coordinates = self._gather_masked_tracks(
-            points, masked_mask, max_masked
-        )  # (B, 2, max_masked)
         masked_true_features = self._gather_masked_tracks(
             features, masked_mask, max_masked
         )  # (B, input_dim, max_masked)
 
         # Step 4: Decode masked tracks (features only)
+        # The decoder receives only backbone tokens and the count of masked
+        # tracks. No (η, φ) coordinates — this prevents the decoder from
+        # bypassing the backbone via spatial shortcuts.
         predicted_features = self.decoder(
-            backbone_tokens, masked_coordinates, max_masked
+            backbone_tokens, max_masked
         )  # (B, num_output_features, max_masked)
 
         # Step 5: Compute feature reconstruction loss per event
