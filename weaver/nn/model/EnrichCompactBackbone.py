@@ -124,27 +124,35 @@ class CompactionStage(nn.Module):
         """
         batch_size = coordinates.shape[0]
 
-        # Step 1: Farthest Point Sampling → select P_out centroid indices
-        centroid_indices = farthest_point_sampling(
-            coordinates, mask, self.num_output_points
-        )  # (B, P_out)
+        # FPS and kNN produce index tensors — no gradients flow through them.
+        # Wrapping in no_grad() avoids autograd bookkeeping overhead for the
+        # 256+128 sequential FPS iterations and the kNN distance computation.
+        with torch.no_grad():
+            # Step 1: Farthest Point Sampling → select P_out centroid indices
+            centroid_indices = farthest_point_sampling(
+                coordinates, mask, self.num_output_points
+            )  # (B, P_out)
 
-        # Gather centroid data using the selected indices
+            # Gather centroid coordinates (no gradient needed for kNN input)
+            idx_expanded = centroid_indices.unsqueeze(1)  # (B, 1, P_out)
+            centroid_coordinates = coordinates.gather(
+                2, idx_expanded.expand(-1, 2, -1)
+            )  # (B, 2, P_out)
+
+            # Step 2: Cross-set kNN — find K nearest reference points per centroid
+            # No self-match exclusion (query_reference_indices=None) because we
+            # do not compute pairwise_lv_fts, so ΔR=0 is harmless.
+            neighbor_indices = cross_set_knn(
+                centroid_coordinates, coordinates, self.num_neighbors, mask,
+                query_reference_indices=None,
+            )  # (B, P_out, K)
+
+        # Gather centroid features (outside no_grad — gradients flow through
+        # the feature gathering for backprop to the enrichment layers)
         idx_expanded = centroid_indices.unsqueeze(1)  # (B, 1, P_out)
-        centroid_coordinates = coordinates.gather(
-            2, idx_expanded.expand(-1, 2, -1)
-        )  # (B, 2, P_out)
         centroid_features = features.gather(
             2, idx_expanded.expand(-1, features.shape[1], -1)
         )  # (B, C_in, P_out)
-
-        # Step 2: Cross-set kNN — find K nearest reference points per centroid
-        # No self-match exclusion (query_reference_indices=None) because we
-        # do not compute pairwise_lv_fts, so ΔR=0 is harmless.
-        neighbor_indices = cross_set_knn(
-            centroid_coordinates, coordinates, self.num_neighbors, mask,
-            query_reference_indices=None,
-        )  # (B, P_out, K)
 
         # Step 3: Gather neighbor features
         neighbor_features = cross_set_gather(
