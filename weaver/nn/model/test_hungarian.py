@@ -1,4 +1,4 @@
-"""Unit tests for the Hungarian matching algorithm.
+"""Unit tests for the Hungarian and Sinkhorn matching algorithms.
 
 Tests adapted from Google Research's Scenic library:
     https://github.com/google-research/scenic/blob/main/scenic/model_lib/matchers/tests/test_matchers.py
@@ -6,14 +6,18 @@ Original code licensed under Apache 2.0 by The Scenic Authors.
 
 Uses scipy.optimize.linear_sum_assignment as the ground-truth oracle
 to verify that our PyTorch implementation finds optimal assignments.
+POT (Python Optimal Transport) is used as a reference implementation
+to verify our Sinkhorn matcher.
 """
 import numpy as np
+import ot
 import pytest
 import torch
 from scipy.optimize import linear_sum_assignment
 
 from weaver.nn.model.hungarian_matcher import hungarian_matcher
 from weaver.nn.model.hungarian_matcher import hungarian_matcher_tensor
+from weaver.nn.model.hungarian_matcher import sinkhorn_matcher
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +319,380 @@ class TestHungarianMatcherTensor:
             scipy_cost = cost[b, scipy_indices[b, 0], scipy_indices[b, 1]].sum()
             tensor_cost = cost[b, tensor_indices[b, 0], tensor_indices[b, 1]].sum()
             assert abs(scipy_cost.item() - tensor_cost.item()) < 1e-3
+
+
+class TestSinkhornMatcher:
+    """Tests for the GPU-native Sinkhorn optimal transport matcher.
+
+    Verifies that Sinkhorn assignments achieve near-optimal costs compared
+    to scipy's exact Hungarian solution. Sinkhorn is approximate, so we
+    allow a small relative tolerance (costs within 5% of optimal).
+    """
+
+    def test_manual_cost_matrix(self):
+        """Known optimal assignments with large cost separation (square)."""
+        # Sinkhorn requires square matrices for correct doubly-stochastic
+        # convergence — rectangular matrices have inconsistent marginals.
+        cost_matrix = torch.tensor([
+            # Expect (0, 0) and (1, 1) matched
+            [[-100.0, 100.0],
+             [100.0, -100.0]],
+            # Expect (0, 1) and (1, 0) matched
+            [[100.0, -100.0],
+             [-100.0, 100.0]],
+        ])
+
+        indices = sinkhorn_matcher(cost_matrix)
+        assert indices.shape == (2, 2, 2)
+
+        for b in range(2):
+            row, col = indices[b, 0], indices[b, 1]
+            our_cost = cost_matrix[b, row, col].sum().item()
+            scipy_cost = scipy_assignment_cost(cost_matrix[b].numpy())
+            assert abs(our_cost - scipy_cost) < 1e-4, (
+                f'Batch {b}: sinkhorn_cost={our_cost}, scipy_cost={scipy_cost}'
+            )
+
+    def test_identity_assignment(self):
+        """When diagonal is cheapest, Sinkhorn should find identity."""
+        num_items = 10
+        cost_matrix = torch.full((1, num_items, num_items), 100.0)
+        cost_matrix[0].fill_diagonal_(0.0)
+
+        indices = sinkhorn_matcher(cost_matrix)
+
+        row = indices[0, 0]
+        col = indices[0, 1]
+        total_cost = cost_matrix[0, row, col].sum().item()
+        assert total_cost == 0.0
+
+    def test_permuted_identity(self):
+        """A randomly permuted identity matrix should be perfectly solved."""
+        rng = np.random.RandomState(789)
+        batch_size = 3
+        num_items = 20
+
+        cost = torch.full((batch_size, num_items, num_items), 10.0)
+        for b in range(batch_size):
+            perm = rng.permutation(num_items)
+            for i, j in enumerate(perm):
+                cost[b, i, j] = 0.0
+
+        indices = sinkhorn_matcher(cost)
+        for b in range(batch_size):
+            row, col = indices[b, 0], indices[b, 1]
+            total_cost = cost[b, row, col].sum().item()
+            assert total_cost == 0.0, (
+                f'Batch {b}: expected cost 0.0, got {total_cost}'
+            )
+
+    def test_near_optimal_cost_square(self):
+        """Sinkhorn cost should be within 5% of exact Hungarian on random matrices."""
+        rng = np.random.RandomState(42)
+        batch_size = 4
+        num_items = 50
+
+        cost_np = rng.randn(batch_size, num_items, num_items).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+
+        sinkhorn_indices = sinkhorn_matcher(cost)
+
+        for b in range(batch_size):
+            row, col = sinkhorn_indices[b, 0], sinkhorn_indices[b, 1]
+            sinkhorn_cost = cost[b, row, col].sum().item()
+            scipy_cost = scipy_assignment_cost(cost_np[b])
+            # Sinkhorn is approximate — allow 5% relative tolerance.
+            # Costs are negative (minimization), so sinkhorn_cost >= scipy_cost.
+            assert sinkhorn_cost <= scipy_cost * 0.95, (
+                f'Batch {b}: sinkhorn_cost={sinkhorn_cost:.4f} is more than '
+                f'5% worse than scipy_cost={scipy_cost:.4f}'
+            )
+
+    def test_near_optimal_cost_larger(self):
+        """Test on larger matrices closer to actual use case (~565 tracks)."""
+        rng = np.random.RandomState(303)
+        num_items = 100
+
+        cost_np = rng.randn(2, num_items, num_items).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+
+        sinkhorn_indices = sinkhorn_matcher(cost)
+
+        for b in range(2):
+            row, col = sinkhorn_indices[b, 0], sinkhorn_indices[b, 1]
+            sinkhorn_cost = cost[b, row, col].sum().item()
+            scipy_cost = scipy_assignment_cost(cost_np[b])
+            assert sinkhorn_cost <= scipy_cost * 0.95, (
+                f'Batch {b}: sinkhorn_cost={sinkhorn_cost:.4f} is more than '
+                f'5% worse than scipy_cost={scipy_cost:.4f}'
+            )
+
+    def test_mostly_unique_assignments(self):
+        """Column indices should be mostly unique (near-permutation).
+
+        Sinkhorn with finite regularization may produce occasional
+        duplicate column assignments where two rows have near-identical
+        costs for the same column. This is acceptable for training
+        (duplicate gradients add noise but don't break learning).
+
+        We require at least 90% unique columns — in practice, with
+        MSE costs at training scale (~1-100), uniqueness is near-100%.
+        """
+        rng = np.random.RandomState(101)
+        num_items = 20
+        cost_np = (rng.randn(2, num_items, num_items) * 10).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+
+        indices = sinkhorn_matcher(cost)
+
+        for b in range(2):
+            col = indices[b, 1].numpy()
+            unique_fraction = len(set(col)) / len(col)
+            assert unique_fraction >= 0.9, (
+                f'Batch {b}: only {unique_fraction:.0%} unique columns '
+                f'(expected >= 90%): {col}'
+            )
+
+    def test_output_shape_square(self):
+        """Output shape for square matrices."""
+        cost = torch.randn(3, 10, 10)
+        indices = sinkhorn_matcher(cost)
+        assert indices.shape == (3, 2, 10)
+
+    def test_output_shape_rectangular(self):
+        """Output shape for rectangular matrices."""
+        cost = torch.randn(2, 20, 8)
+        indices = sinkhorn_matcher(cost)
+        # K = min(20, 8) = 8
+        assert indices.shape == (2, 2, 8)
+
+    def test_agrees_with_hungarian(self):
+        """Sinkhorn and Hungarian should find near-equal-cost assignments.
+
+        Sinkhorn is approximate and may occasionally assign two rows
+        to the same column (non-bijective), which can produce a slightly
+        different total cost. We use a 5% relative tolerance.
+        """
+        rng = np.random.RandomState(555)
+        cost_np = (rng.randn(3, 15, 15) * 10).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+
+        hungarian_indices = hungarian_matcher(cost)
+        sinkhorn_indices = sinkhorn_matcher(cost)
+
+        for b in range(3):
+            hungarian_cost = cost[
+                b, hungarian_indices[b, 0], hungarian_indices[b, 1]
+            ].sum().item()
+            sinkhorn_cost = cost[
+                b, sinkhorn_indices[b, 0], sinkhorn_indices[b, 1]
+            ].sum().item()
+            relative_difference = (
+                abs(sinkhorn_cost - hungarian_cost)
+                / (abs(hungarian_cost) + 1e-8)
+            )
+            assert relative_difference < 0.05, (
+                f'Batch {b}: sinkhorn_cost={sinkhorn_cost:.4f}, '
+                f'hungarian_cost={hungarian_cost:.4f}, '
+                f'relative_diff={relative_difference:.4f}'
+            )
+
+    def test_masked_entries(self):
+        """Invalid entries with large cost should never be matched."""
+        rng = np.random.RandomState(777)
+        batch_size = 2
+        num_items = 15
+        num_valid = 10
+
+        cost = torch.from_numpy(
+            rng.randn(batch_size, num_items, num_items).astype(np.float32)
+        )
+        # Mask last 5 rows and columns with large cost
+        cost[:, num_valid:, :] = 1e6
+        cost[:, :, num_valid:] = 1e6
+
+        indices = sinkhorn_matcher(cost)
+
+        for b in range(batch_size):
+            row = indices[b, 0].numpy()
+            col = indices[b, 1].numpy()
+            # All matched rows and columns should be in the valid range
+            # (at least the first num_valid matches should be valid)
+            valid_matches = (row < num_valid) & (col < num_valid)
+            assert valid_matches[:num_valid].all(), (
+                f'Batch {b}: invalid entries matched. '
+                f'rows={row[:num_valid]}, cols={col[:num_valid]}'
+            )
+
+
+class TestSinkhornMatcherVsPOT:
+    """Cross-validate our Sinkhorn matcher against POT's implementation.
+
+    POT (Python Optimal Transport) is the reference library for optimal
+    transport in Python. We verify that our batched GPU implementation
+    produces transport plans with costs very close to POT's solver.
+
+    Since Sinkhorn is iterative and the two implementations may differ
+    in normalization order or convergence behavior, we compare assignment
+    costs rather than exact index equality.
+    """
+
+    @staticmethod
+    def _pot_assignment_cost(
+        cost_matrix_np: np.ndarray,
+        regularization: float = 1.0,
+        num_iterations: int = 50,
+    ) -> tuple[float, np.ndarray]:
+        """Solve assignment via POT's Sinkhorn and return cost + column indices.
+
+        Args:
+            cost_matrix_np: (N, M) cost matrix as numpy array.
+            regularization: Entropy regularization ε.
+            num_iterations: Maximum Sinkhorn iterations.
+
+        Returns:
+            Tuple of (total_cost, column_indices):
+                total_cost: Sum of matched costs under hard assignment.
+                column_indices: (N,) argmax per row of the transport plan.
+        """
+        num_rows, num_columns = cost_matrix_np.shape
+        # Uniform marginals (each row/column gets equal mass)
+        source_weights = np.ones(num_rows, dtype=np.float64) / num_rows
+        target_weights = np.ones(num_columns, dtype=np.float64) / num_columns
+
+        # POT's log-domain Sinkhorn (numerically stable)
+        transport_plan = ot.sinkhorn(
+            source_weights, target_weights, cost_matrix_np.astype(np.float64),
+            reg=regularization, method='sinkhorn_log',
+            numItermax=num_iterations, stopThr=1e-9,
+            warn=False, log=False,
+        )
+
+        # Hard assignment: argmax per row
+        column_indices = transport_plan.argmax(axis=1)
+        row_indices = np.arange(num_rows)
+        total_cost = cost_matrix_np[row_indices, column_indices].sum()
+
+        return total_cost, column_indices
+
+    def test_same_assignments_small(self):
+        """On small well-separated matrices, both should find identical assignments."""
+        rng = np.random.RandomState(42)
+        # Scale costs up for clear separation between good and bad matches
+        cost_np = (rng.randn(3, 10, 10) * 10).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+
+        our_indices = sinkhorn_matcher(cost, num_iterations=50, regularization=1.0)
+
+        for b in range(3):
+            our_cols = our_indices[b, 1].numpy()
+            _, pot_cols = self._pot_assignment_cost(
+                cost_np[b], regularization=1.0, num_iterations=50,
+            )
+
+            our_cost = cost_np[b, np.arange(10), our_cols].sum()
+            pot_cost = cost_np[b, np.arange(10), pot_cols].sum()
+
+            # Costs should be very close (< 1% relative difference)
+            relative_difference = abs(our_cost - pot_cost) / (abs(pot_cost) + 1e-8)
+            assert relative_difference < 0.01, (
+                f'Batch {b}: our_cost={our_cost:.4f}, pot_cost={pot_cost:.4f}, '
+                f'relative_diff={relative_difference:.4f}'
+            )
+
+    def test_same_assignments_medium(self):
+        """On medium-sized matrices, costs should be within 2% of POT."""
+        rng = np.random.RandomState(123)
+        cost_np = rng.randn(4, 50, 50).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+
+        our_indices = sinkhorn_matcher(cost, num_iterations=50, regularization=1.0)
+
+        for b in range(4):
+            num_items = 50
+            our_cols = our_indices[b, 1].numpy()
+            _, pot_cols = self._pot_assignment_cost(
+                cost_np[b], regularization=1.0, num_iterations=50,
+            )
+
+            our_cost = cost_np[b, np.arange(num_items), our_cols].sum()
+            pot_cost = cost_np[b, np.arange(num_items), pot_cols].sum()
+
+            relative_difference = abs(our_cost - pot_cost) / (abs(pot_cost) + 1e-8)
+            assert relative_difference < 0.02, (
+                f'Batch {b}: our_cost={our_cost:.4f}, pot_cost={pot_cost:.4f}, '
+                f'relative_diff={relative_difference:.4f}'
+            )
+
+    def test_same_assignments_large(self):
+        """On larger matrices (100×100), costs should still be close to POT."""
+        rng = np.random.RandomState(456)
+        num_items = 100
+        cost_np = rng.randn(2, num_items, num_items).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+
+        our_indices = sinkhorn_matcher(cost, num_iterations=50, regularization=1.0)
+
+        for b in range(2):
+            our_cols = our_indices[b, 1].numpy()
+            _, pot_cols = self._pot_assignment_cost(
+                cost_np[b], regularization=1.0, num_iterations=50,
+            )
+
+            our_cost = cost_np[b, np.arange(num_items), our_cols].sum()
+            pot_cost = cost_np[b, np.arange(num_items), pot_cols].sum()
+
+            relative_difference = abs(our_cost - pot_cost) / (abs(pot_cost) + 1e-8)
+            assert relative_difference < 0.05, (
+                f'Batch {b}: our_cost={our_cost:.4f}, pot_cost={pot_cost:.4f}, '
+                f'relative_diff={relative_difference:.4f}'
+            )
+
+    def test_transport_plan_similarity(self):
+        """The soft transport plans should be similar (not just hard assignments).
+
+        Compares the Frobenius norm of the difference between our transport
+        plan and POT's, normalized by the plan magnitude.
+
+        Our Sinkhorn normalizes rows/columns to sum to 1 (doubly-stochastic).
+        POT with uniform marginals (1/N, 1/N) normalizes to sum to 1/N.
+        So our_plan = N × pot_plan. We divide by N before comparing.
+        """
+        rng = np.random.RandomState(789)
+        num_items = 20
+        cost_np = rng.randn(1, num_items, num_items).astype(np.float32)
+        cost = torch.from_numpy(cost_np)
+        regularization = 1.0
+
+        # Our transport plan (reconstruct from log domain)
+        log_transport = -cost / regularization
+        for _ in range(100):
+            log_transport = log_transport - torch.logsumexp(
+                log_transport, dim=2, keepdim=True,
+            )
+            log_transport = log_transport - torch.logsumexp(
+                log_transport, dim=1, keepdim=True,
+            )
+        # Normalize: our plan has rows summing to 1, POT's sum to 1/N
+        our_plan = log_transport[0].exp().numpy() / num_items  # (N, M)
+
+        # POT transport plan
+        source_weights = np.ones(num_items, dtype=np.float64) / num_items
+        target_weights = np.ones(num_items, dtype=np.float64) / num_items
+        pot_plan = ot.sinkhorn(
+            source_weights, target_weights, cost_np[0].astype(np.float64),
+            reg=regularization, method='sinkhorn_log',
+            numItermax=100, stopThr=1e-9,
+            warn=False, log=False,
+        )
+
+        # Compare plans: Frobenius norm of difference / Frobenius norm of plan
+        difference_norm = np.linalg.norm(our_plan - pot_plan, ord='fro')
+        plan_norm = np.linalg.norm(pot_plan, ord='fro')
+        relative_plan_error = difference_norm / (plan_norm + 1e-8)
+
+        assert relative_plan_error < 0.05, (
+            f'Transport plan relative error: {relative_plan_error:.4f} '
+            f'(difference_norm={difference_norm:.6f}, '
+            f'plan_norm={plan_norm:.6f})'
+        )

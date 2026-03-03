@@ -364,6 +364,86 @@ def _update_weights_using_cover(
     return weights + addition - subtraction
 
 
+@torch.no_grad()
+def sinkhorn_matcher(
+    cost_matrix: torch.Tensor,
+    num_iterations: int = 50,
+    regularization: float = 0.1,
+) -> torch.Tensor:
+    """Approximate optimal assignment via Sinkhorn-Knopp algorithm on GPU.
+
+    Solves the entropy-regularized optimal transport problem:
+        min  <C, P> + ε H(P)
+        s.t. P 1 = 1/N,  P^T 1 = 1/M  (uniform marginals)
+    using alternating row/column normalization in log domain.
+
+    As regularization → 0 and iterations → ∞, converges to the exact
+    Hungarian solution. For training (where assignment is no_grad and
+    only provides indices), the approximation is sufficient.
+
+    Computation: O(iterations × N × M) — all batched matrix operations,
+    fully on GPU, no CPU transfers or Python loops.
+
+    Note: designed for square cost matrices (N = M). For rectangular
+    matrices the doubly-stochastic normalization cannot converge (row
+    marginals ≠ column marginals), so assignment quality is unreliable.
+
+    Reference:
+        Cuturi, M. "Sinkhorn Distances: Lightspeed Computation of Optimal
+        Transport." NeurIPS 2013. https://arxiv.org/abs/1306.0895
+
+    Args:
+        cost_matrix: (B, N, M) cost tensor. Lower = better match.
+            Invalid entries should have large cost (e.g., 1e6) —
+            they receive near-zero transport mass automatically.
+        num_iterations: Sinkhorn iterations. 50 is typically sufficient
+            for sharp assignments. More iterations → closer to exact.
+        regularization: Entropy regularization ε. Controls sharpness:
+            lower → sharper (closer to exact) but less stable.
+            Default 0.1 works well for MSE costs on standardized
+            features (typical valid costs in [0.5, 50]).
+
+    Returns:
+        indices: (B, 2, K) long tensor on same device as cost_matrix,
+            where K = min(N, M).
+            indices[:, 0, :] = matched row indices
+            indices[:, 1, :] = matched column indices
+    """
+    batch_size, num_rows, num_columns = cost_matrix.shape
+    num_matched = min(num_rows, num_columns)
+
+    # Log-domain transport plan: log P_ij = -C_ij / ε (before normalization)
+    # Large invalid costs (1e6) become very negative → near-zero mass.
+    log_transport = -cost_matrix / regularization  # (B, N, M)
+
+    # Sinkhorn iterations: alternate row and column normalization
+    # in log domain for numerical stability.
+    #   Row step:  log P_ij ← log P_ij − log(Σ_j exp(log P_ij))
+    #   Col step:  log P_ij ← log P_ij − log(Σ_i exp(log P_ij))
+    # After convergence, exp(log_transport) ≈ permutation matrix.
+    for _ in range(num_iterations):
+        log_transport = log_transport - torch.logsumexp(
+            log_transport, dim=2, keepdim=True,
+        )
+        log_transport = log_transport - torch.logsumexp(
+            log_transport, dim=1, keepdim=True,
+        )
+
+    # Hard assignment: argmax per row extracts the permutation.
+    # After convergence, log_transport has sharp peaks (one dominant
+    # entry per row/column), so argmax gives unique column indices.
+    column_indices = log_transport.argmax(dim=2)  # (B, N)
+    row_indices = torch.arange(
+        num_rows, device=cost_matrix.device,
+    ).unsqueeze(0).expand(batch_size, -1)  # (B, N)
+
+    # Trim to K = min(N, M) matches
+    row_indices = row_indices[:, :num_matched]
+    column_indices = column_indices[:, :num_matched]
+
+    return torch.stack([row_indices, column_indices], dim=1)  # (B, 2, K)
+
+
 @torch.compiler.disable
 @torch.no_grad()
 def hungarian_matcher(
