@@ -3,10 +3,17 @@
 Self-supervised pretraining via masked track reconstruction with the
 two-stage Enrich-Compact backbone:
     1. Enrich ALL tracks with neighbor context (ParticleNeXt-style)
-    2. Randomly mask 40% of tracks
+    2. Randomly mask a fraction of tracks
     3. Densely pack visible enriched tracks → compact via PointNet++
     4. Decode masked tracks via cross-attention to backbone tokens
     5. Reconstruct original 7 raw features (standardized by weaver)
+    6. Hungarian-match predicted set to ground-truth set, compute MSE
+
+The decoder outputs a SET of predicted tracks with no inherent ordering.
+Hungarian matching (optimal bipartite assignment) finds the best 1-to-1
+pairing between predictions and targets before computing the loss. This
+eliminates the spurious assignment problem that would otherwise inject
+noise into gradients.
 
 Masking happens BETWEEN enrichment and compaction. This way, visible
 tracks carry partial information about masked neighbors from the
@@ -37,6 +44,7 @@ import torch
 import torch.nn as nn
 
 from weaver.nn.model.EnrichCompactBackbone import EnrichCompactBackbone
+from weaver.nn.model.hungarian_matcher import hungarian_matcher
 
 
 class MaskedTrackDecoder(nn.Module):
@@ -376,6 +384,111 @@ class MaskedTrackPretrainer(nn.Module):
 
         return gathered, validity_mask
 
+    def _hungarian_reconstruction_loss(
+        self,
+        predicted_features: torch.Tensor,
+        true_features: torch.Tensor,
+        validity_mask: torch.Tensor,
+        num_valid_per_event: torch.Tensor,
+        num_feature_channels: int,
+    ) -> torch.Tensor:
+        """Compute MSE reconstruction loss with Hungarian-matched assignment.
+
+        The decoder outputs a SET of predicted tracks with no inherent ordering.
+        Query embeddings are learnable slot differentiators, not tied to specific
+        masked positions. We use the Hungarian algorithm to find the optimal
+        1-to-1 assignment between predicted and ground-truth tracks that
+        minimizes total MSE, then compute the loss on matched pairs.
+
+        Cost matrix:
+            C[i, j] = Σ_f (pred_f_i − true_f_j)²
+        where i indexes predicted slots and j indexes ground-truth tracks.
+        Hungarian finds permutation σ minimizing Σ_i C[i, σ(i)].
+
+        The assignment is computed with no gradients (it returns indices).
+        The MSE loss is computed on GPU with matched pairs, so gradients
+        flow through the decoder predictions normally.
+
+        Args:
+            predicted_features: (B, F, K) predicted features per slot.
+            true_features: (B, F, K) ground-truth features per track.
+            validity_mask: (B, 1, K) boolean mask for valid (non-padded) slots.
+            num_valid_per_event: (B,) count of valid tracks per event.
+            num_feature_channels: F — number of feature channels.
+
+        Returns:
+            per_event_loss: (B,) MSE loss per event.
+        """
+        batch_size = predicted_features.shape[0]
+        max_tracks = predicted_features.shape[2]
+        device = predicted_features.device
+
+        # Build pairwise cost matrix: C[b, i, j] = Σ_f (pred[b,f,i] − true[b,f,j])²
+        # pred: (B, F, K) → (B, K, F) for easier pairwise computation
+        predicted_transposed = predicted_features.transpose(1, 2)  # (B, K, F)
+        true_transposed = true_features.transpose(1, 2)  # (B, K, F)
+
+        # cost[b, i, j] = ||pred[b, i, :] - true[b, j, :]||²
+        # = Σ_f (pred[b,i,f] − true[b,j,f])²
+        # Using expansion: ||a-b||² = ||a||² + ||b||² - 2 a·b
+        predicted_squared = (predicted_transposed ** 2).sum(dim=2)  # (B, K)
+        true_squared = (true_transposed ** 2).sum(dim=2)  # (B, K)
+        cross_term = torch.bmm(
+            predicted_transposed, true_transposed.transpose(1, 2),
+        )  # (B, K, K)
+        cost_matrix = (
+            predicted_squared.unsqueeze(2)
+            + true_squared.unsqueeze(1)
+            - 2 * cross_term
+        )  # (B, K, K)
+
+        # Mask out invalid slots: set cost to large value for padded positions
+        # so Hungarian never matches them
+        validity_flat = validity_mask.squeeze(1)  # (B, K)
+        large_cost = 1e6
+        # Invalid predicted slots (rows)
+        cost_matrix = cost_matrix.masked_fill(
+            ~validity_flat.unsqueeze(2), large_cost,
+        )
+        # Invalid true slots (columns)
+        cost_matrix = cost_matrix.masked_fill(
+            ~validity_flat.unsqueeze(1), large_cost,
+        )
+
+        # Hungarian matching: find optimal assignment (no gradients)
+        # indices: (B, 2, K) — indices[:, 0] = predicted slot, indices[:, 1] = true slot
+        indices = hungarian_matcher(cost_matrix.detach())
+        matched_pred_indices = indices[:, 0, :]  # (B, K)
+        matched_true_indices = indices[:, 1, :]  # (B, K)
+
+        # Gather matched predictions and targets using the optimal assignment
+        # Expand indices for feature gathering: (B, K) → (B, F, K)
+        pred_gather = matched_pred_indices.unsqueeze(1).expand(
+            -1, num_feature_channels, -1,
+        )
+        true_gather = matched_true_indices.unsqueeze(1).expand(
+            -1, num_feature_channels, -1,
+        )
+
+        matched_predictions = predicted_features.gather(2, pred_gather)  # (B, F, K)
+        matched_targets = true_features.gather(2, true_gather)  # (B, F, K)
+
+        # Build validity mask for matched pairs
+        matched_validity = validity_flat.gather(
+            1, matched_pred_indices,
+        ).unsqueeze(1)  # (B, 1, K)
+
+        # L = (1 / N_valid) × Σ_i Σ_f (matched_pred_f_i − matched_true_f_i)²
+        feature_error = (
+            (matched_predictions - matched_targets).square()
+            * matched_validity.float()
+        )  # (B, F, K)
+        per_event_loss = feature_error.sum(dim=(1, 2)) / (
+            num_valid_per_event.float() * num_feature_channels
+        ).clamp(min=1.0)  # (B,)
+
+        return per_event_loss
+
     def forward(
         self,
         points: torch.Tensor,
@@ -469,19 +582,27 @@ class MaskedTrackPretrainer(nn.Module):
             backbone_tokens, max_masked,
         )  # (B, num_output_features, max_masked)
 
-        # Step 7: Compute feature reconstruction loss per event
-        # L = (1 / N_masked) × Σ_i Σ_f (pred_f_i - true_f_i)²
+        # Step 7: Hungarian-matched feature reconstruction loss per event
+        #
+        # The decoder outputs a SET of predicted tracks with no inherent
+        # ordering — query embeddings are learnable slot differentiators,
+        # not tied to specific masked positions. Therefore we use the
+        # Hungarian algorithm to find the optimal 1-to-1 assignment between
+        # predicted and ground-truth tracks that minimizes total MSE.
+        #
+        # Cost matrix: C[i, j] = Σ_f (pred_f_i − true_f_j)²
+        #   where i indexes predicted slots and j indexes ground-truth tracks.
+        # Hungarian finds permutation σ minimizing Σ_i C[i, σ(i)].
+        #
+        # The assignment is computed with no gradients (returns indices only).
+        # The MSE loss is computed on GPU with matched pairs, so gradients
+        # flow back through the decoder predictions normally.
         #
         # Features are already standardized (clipped to [-5, 5]) by weaver,
         # so MSE is well-scaled across all feature channels.
-        # Use the validity mask to exclude zero-padded slots.
-        track_valid = masked_validity.float()  # (B, 1, max_masked)
-
-        feature_error = (
-            (predicted_features - masked_true_features).square() * track_valid
-        )  # (B, num_features, max_masked)
-        per_event_loss = feature_error.sum(dim=(1, 2)) / (
-            num_masked_per_event.float() * num_features
-        ).clamp(min=1.0)  # (B,)
+        per_event_loss = self._hungarian_reconstruction_loss(
+            predicted_features, masked_true_features,
+            masked_validity, num_masked_per_event, num_features,
+        )  # (B,)
 
         return per_event_loss
