@@ -362,6 +362,7 @@ def _update_weights_using_cover(
     return weights + addition - subtraction
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def hungarian_matcher(
     cost_matrix: torch.Tensor,

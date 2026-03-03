@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 
 from weaver.nn.model.EnrichCompactBackbone import EnrichCompactBackbone
-from weaver.nn.model.hungarian_matcher import hungarian_matcher_tensor
+from weaver.nn.model.hungarian_matcher import hungarian_matcher
 
 
 class MaskedTrackDecoder(nn.Module):
@@ -457,7 +457,7 @@ class MaskedTrackPretrainer(nn.Module):
 
         # Hungarian matching: find optimal assignment (no gradients)
         # indices: (B, 2, K) — indices[:, 0] = predicted slot, indices[:, 1] = true slot
-        indices = hungarian_matcher_tensor(cost_matrix.detach())
+        indices = hungarian_matcher(cost_matrix.detach())
         matched_pred_indices = indices[:, 0, :]  # (B, K)
         matched_true_indices = indices[:, 1, :]  # (B, K)
 
