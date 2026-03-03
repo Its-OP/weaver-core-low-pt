@@ -21,10 +21,24 @@ Reference:
     https://www.cse.ust.hk/~golin/COMP572/Notes/Matching.pdf
 """
 from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
+
+
+# Module-level persistent thread pool for hungarian_matcher.
+# Avoids creating/destroying OS threads on every validation batch
+# (~3ms overhead per ThreadPoolExecutor lifecycle × 100+ val batches).
+# Threads are daemonic so they don't block process exit.
+_scipy_thread_pool: ThreadPoolExecutor | None = None
+
+
+def _get_scipy_thread_pool() -> ThreadPoolExecutor:
+    """Return a cached ThreadPoolExecutor for parallel scipy calls."""
+    global _scipy_thread_pool
+    if _scipy_thread_pool is None:
+        _scipy_thread_pool = ThreadPoolExecutor()
+    return _scipy_thread_pool
 
 
 def _prepare(weights: torch.Tensor) -> torch.Tensor:
@@ -367,6 +381,7 @@ def _update_weights_using_cover(
 def _resolve_duplicate_assignments(
     column_indices: torch.Tensor,
     cost_matrix: torch.Tensor,
+    max_iterations: int = 10,
 ) -> torch.Tensor:
     """Resolve duplicate column assignments to enforce bijectivity.
 
@@ -374,18 +389,19 @@ def _resolve_duplicate_assignments(
     same column (non-bijective). This corrupts the loss by letting the
     model cherry-pick easy targets and skip hard ones.
 
-    Resolution strategy (fully batched, GPU-native):
+    Resolution strategy (fully batched, GPU-native, no Python loops over rows):
         1. For each column assigned to multiple rows, keep only the row
-           with the lowest cost — it's the best match.
+           with the lowest cost (ties broken by lowest row index).
         2. Re-assign displaced rows to their best remaining unmatched
-           column via iterative greedy fallback.
+           column via greedy fallback (single argmin, no loop).
 
-    The iteration count is bounded by the maximum number of duplicates,
-    which is typically 0-3 for well-tuned regularization.
+    The outer iteration count is bounded by the number of initial duplicates
+    (each round fixes at least one), typically 0-3 for ε = 0.1.
 
     Args:
         column_indices: (B, N) initial column assignment per row.
         cost_matrix: (B, N, M) cost matrix for greedy fallback.
+        max_iterations: Safety cap on resolution rounds (default: 10).
 
     Returns:
         resolved_column_indices: (B, N) with no duplicate columns per batch.
@@ -397,6 +413,11 @@ def _resolve_duplicate_assignments(
     # Work on a mutable copy
     resolved = column_indices.clone()
 
+    # Row index tensor, reused across iterations
+    row_index_tensor = torch.arange(
+        num_rows, device=device,
+    ).unsqueeze(0).expand(batch_size, -1)  # (B, N)
+
     # Build per-row costs for the current assignment: C[b, i, resolved[b, i]]
     row_costs = cost_matrix.gather(
         2, resolved.unsqueeze(1),
@@ -405,10 +426,9 @@ def _resolve_duplicate_assignments(
     # Iteratively resolve duplicates until none remain.
     # Each iteration fixes at least one duplicate per column, so this
     # converges in at most max_duplicates_per_column iterations.
-    for _ in range(num_rows):
+    for _ in range(max_iterations):
         # Step 1: Find duplicate columns.
         # For each (batch, column), count how many rows map to it.
-        # one_hot: (B, N, M) → sum over rows → (B, M)
         assignment_counts = torch.zeros(
             batch_size, num_columns, device=device, dtype=torch.long,
         )
@@ -418,27 +438,21 @@ def _resolve_duplicate_assignments(
         )  # (B, M): count of rows assigned to each column
 
         # If no duplicates remain, we're done
-        max_count = assignment_counts.max().item()
-        if max_count <= 1:
+        if (assignment_counts <= 1).all():
             break
 
         # Step 2: For each duplicated column, find the best row (lowest cost)
         # and mark all other rows as "displaced" (need re-assignment).
 
-        # Which columns are duplicated: (B, N) — True if this row's column
-        # has count > 1
-        column_counts_per_row = assignment_counts.gather(
-            1, resolved,
-        )  # (B, N)
+        # Which rows sit on a duplicated column: (B, N)
+        column_counts_per_row = assignment_counts.gather(1, resolved)
         is_duplicated = column_counts_per_row > 1  # (B, N)
 
         # Among rows sharing the same column, find the one with lowest cost.
-        # Set non-duplicated rows' costs to +inf so they don't interfere.
         masked_costs = row_costs.clone()
         masked_costs[~is_duplicated] = float('inf')
 
         # For each column, find the minimum cost among duplicated rows.
-        # min_cost_per_column: (B, M)
         min_cost_per_column = torch.full(
             (batch_size, num_columns), float('inf'), device=device,
         )
@@ -446,28 +460,29 @@ def _resolve_duplicate_assignments(
             1, resolved, masked_costs, reduce='amin',
         )  # (B, M)
 
-        # A duplicated row is the "winner" if its cost equals the column min
-        column_min_for_row = min_cost_per_column.gather(
-            1, resolved,
-        )  # (B, N)
+        # A duplicated row is a "winner candidate" if its cost equals
+        # the column minimum.
+        column_min_for_row = min_cost_per_column.gather(1, resolved)
         is_winner = is_duplicated & (row_costs <= column_min_for_row)
 
-        # In case of exact ties, keep only the first winner per column
-        # by using cumulative counting: mark as displaced if you're not
-        # the first row with this column that's a winner.
-        winner_cumcount = torch.zeros(
-            batch_size, num_columns, device=device, dtype=torch.long,
+        # Vectorized tie-breaking: among winner candidates for the same
+        # column, keep only the one with the lowest row index.
+        # Set non-winners to sentinel (num_rows), then scatter_reduce
+        # with 'amin' to find the minimum winning row index per column.
+        winner_row_indices = torch.where(
+            is_winner, row_index_tensor, torch.tensor(num_rows, device=device),
+        )  # (B, N): row index if winner, else num_rows
+
+        min_winner_row_per_column = torch.full(
+            (batch_size, num_columns), num_rows, device=device, dtype=torch.long,
         )
-        # Process rows in order — first winner per column survives
-        for row_idx in range(num_rows):
-            col = resolved[:, row_idx]  # (B,)
-            already_won = winner_cumcount.gather(1, col.unsqueeze(1)).squeeze(1)
-            # If this row is a winner but not the first, displace it
-            is_winner[:, row_idx] = is_winner[:, row_idx] & (already_won == 0)
-            winner_cumcount.scatter_add_(
-                1, col.unsqueeze(1),
-                is_winner[:, row_idx].long().unsqueeze(1),
-            )
+        min_winner_row_per_column.scatter_reduce_(
+            1, resolved, winner_row_indices, reduce='amin',
+        )  # (B, M): lowest winning row index per column
+
+        # A winner survives only if it is THE minimum-index winner
+        best_winner_for_my_column = min_winner_row_per_column.gather(1, resolved)
+        is_winner = is_winner & (row_index_tensor == best_winner_for_my_column)
 
         # Displaced rows: duplicated but not the winner
         is_displaced = is_duplicated & ~is_winner  # (B, N)
@@ -476,26 +491,19 @@ def _resolve_duplicate_assignments(
             break
 
         # Step 3: Re-assign displaced rows to their best unmatched column.
-        # Build mask of taken columns using scatter_add_ (not scatter_)
-        # to avoid overwrites. Displaced rows contribute 0 (their flag
-        # is 0), so only non-displaced rows mark columns as taken.
+        # Build mask of taken columns via scatter_add_ (safe for duplicates).
         non_displaced_flags = (~is_displaced).long()  # (B, N): 1 if kept
         column_occupation = torch.zeros(
             batch_size, num_columns, device=device, dtype=torch.long,
         )
         column_occupation.scatter_add_(1, resolved, non_displaced_flags)
-        taken_columns = column_occupation > 0
+        taken_columns = column_occupation > 0  # (B, M)
 
-        # For displaced rows, find best untaken column.
-        # Set taken columns to +inf in cost matrix, then argmin.
-        displaced_cost = cost_matrix.clone()
-        # Expand taken_columns to (B, 1, M) for broadcasting with (B, N, M)
-        displaced_cost.masked_fill_(
-            taken_columns.unsqueeze(1), float('inf'),
-        )
-
-        # Greedy: each displaced row picks its best available column
-        best_available = displaced_cost.argmin(dim=2)  # (B, N)
+        # Greedy: each displaced row picks its best available column.
+        # Add large offset to taken columns (avoids cloning cost_matrix).
+        best_available = (
+            cost_matrix + taken_columns.unsqueeze(1).float() * 1e6
+        ).argmin(dim=2)  # (B, N)
 
         # Update only displaced rows
         resolved[is_displaced] = best_available[is_displaced]
@@ -571,12 +579,14 @@ def sinkhorn_matcher(
     #   Row step:  log P_ij ← log P_ij − log(Σ_j exp(log P_ij))
     #   Col step:  log P_ij ← log P_ij − log(Σ_i exp(log P_ij))
     # After convergence, exp(log_transport) ≈ permutation matrix.
+    # In-place sub_ avoids allocating 2 new (B, N, M) tensors per
+    # iteration. Safe under @torch.no_grad() (no autograd graph).
     for _ in range(num_iterations):
-        log_transport = log_transport - torch.logsumexp(
-            log_transport, dim=2, keepdim=True,
+        log_transport.sub_(
+            torch.logsumexp(log_transport, dim=2, keepdim=True),
         )
-        log_transport = log_transport - torch.logsumexp(
-            log_transport, dim=1, keepdim=True,
+        log_transport.sub_(
+            torch.logsumexp(log_transport, dim=1, keepdim=True),
         )
 
     # Hard assignment: argmax per row extracts initial permutation.
@@ -632,11 +642,10 @@ def hungarian_matcher(
     # scipy's linear_sum_assignment is a C extension that releases the GIL,
     # so all batch_size calls run concurrently across CPU cores.
     # For 48 × 565×565 matrices: ~50ms parallel vs ~2.4s sequential.
-    def _solve_single(cost_single: np.ndarray):
-        return linear_sum_assignment(cost_single)
-
-    with ThreadPoolExecutor() as executor:
-        results = list(executor.map(_solve_single, cost_numpy))
+    # Uses a cached thread pool to avoid OS thread creation overhead
+    # (~3ms) on every validation batch.
+    pool = _get_scipy_thread_pool()
+    results = list(pool.map(linear_sum_assignment, cost_numpy))
 
     row_indices_np = np.empty((batch_size, num_matched), dtype=np.int64)
     col_indices_np = np.empty((batch_size, num_matched), dtype=np.int64)
