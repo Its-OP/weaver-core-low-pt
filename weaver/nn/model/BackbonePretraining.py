@@ -44,6 +44,7 @@ import torch
 import torch.nn as nn
 
 from weaver.nn.model.EnrichCompactBackbone import EnrichCompactBackbone
+from weaver.nn.model.hungarian_matcher import hungarian_matcher
 from weaver.nn.model.hungarian_matcher import sinkhorn_matcher
 
 
@@ -455,9 +456,15 @@ class MaskedTrackPretrainer(nn.Module):
             ~validity_flat.unsqueeze(1), large_cost,
         )
 
-        # Hungarian matching: find optimal assignment (no gradients)
+        # Optimal assignment: find best 1-to-1 matching (no gradients).
+        # Training: Sinkhorn (GPU-native, ~5% suboptimal but fast).
+        # Validation: exact Hungarian (scipy CPU, gives true optimal cost
+        #   for honest evaluation — no approximation gap in the metric).
         # indices: (B, 2, K) — indices[:, 0] = predicted slot, indices[:, 1] = true slot
-        indices = sinkhorn_matcher(cost_matrix.detach())
+        if self.training:
+            indices = sinkhorn_matcher(cost_matrix.detach())
+        else:
+            indices = hungarian_matcher(cost_matrix.detach())
         matched_pred_indices = indices[:, 0, :]  # (B, K)
         matched_true_indices = indices[:, 1, :]  # (B, K)
 
