@@ -457,12 +457,18 @@ class MaskedTrackPretrainer(nn.Module):
         )
 
         # Optimal assignment: find best 1-to-1 matching (no gradients).
-        # Training: Sinkhorn (GPU-native, ~5% suboptimal but fast).
-        # Validation: exact Hungarian (scipy CPU, gives true optimal cost
-        #   for honest evaluation — no approximation gap in the metric).
+        # Training: raw Sinkhorn (GPU-native, no dedup). Non-bijective —
+        #   multiple predictions can match the same target. This lets the
+        #   model cherry-pick easy targets first (lower train loss), but
+        #   the gradient signal is smooth and fully on-GPU.
+        # Validation: exact Hungarian (scipy CPU, bijective). Gives the
+        #   true optimal 1-to-1 assignment cost — honest metric with no
+        #   cherry-picking.
         # indices: (B, 2, K) — indices[:, 0] = predicted slot, indices[:, 1] = true slot
         if self.training:
-            indices = sinkhorn_matcher(cost_matrix.detach())
+            indices = sinkhorn_matcher(
+                cost_matrix.detach(), deduplicate=False,
+            )
         else:
             indices = hungarian_matcher(cost_matrix.detach())
         matched_pred_indices = indices[:, 0, :]  # (B, K)

@@ -521,25 +521,23 @@ def sinkhorn_matcher(
     cost_matrix: torch.Tensor,
     num_iterations: int = 50,
     regularization: float = 0.1,
+    deduplicate: bool = True,
 ) -> torch.Tensor:
     """Approximate optimal assignment via Sinkhorn-Knopp algorithm on GPU.
 
     Solves the entropy-regularized optimal transport problem:
         min  <C, P> + ε H(P)
         s.t. P 1 = 1/N,  P^T 1 = 1/M  (uniform marginals)
-    using alternating row/column normalization in log domain, followed
-    by greedy duplicate resolution to guarantee bijective assignments.
+    using alternating row/column normalization in log domain.
 
-    Two-phase approach:
-        Phase 1 (Sinkhorn): O(iterations × N × M) batched tensor ops
-            produce a near-optimal soft transport plan. Argmax per row
-            extracts hard assignments that are ~95-99% unique.
-        Phase 2 (Dedup): For the rare duplicate column assignments,
-            keep the lowest-cost row and greedily re-assign displaced
-            rows to their best available column. Typically 0-3 iterations.
-
-    This gives exact bijectivity (every ground-truth matched once) with
-    GPU-native speed — no CPU transfers, no scipy.
+    Two modes:
+        deduplicate=True (default):
+            Phase 1 (Sinkhorn) + Phase 2 (Dedup) → bijective assignments.
+            Every ground-truth track is matched exactly once.
+        deduplicate=False:
+            Phase 1 only → raw argmax, may assign multiple rows to the
+            same column. Non-bijective: allows the model to cherry-pick
+            easy targets (lower loss, but some targets unmatched).
 
     Note: designed for square cost matrices (N = M). For rectangular
     matrices the doubly-stochastic normalization cannot converge (row
@@ -559,6 +557,9 @@ def sinkhorn_matcher(
             lower → sharper (closer to exact) but less stable.
             Default 0.1 works well for MSE costs on standardized
             features (typical valid costs in [0.5, 50]).
+        deduplicate: If True, resolve duplicate column assignments via
+            greedy post-processing (bijective). If False, keep raw
+            argmax (non-bijective, may have duplicate columns).
 
     Returns:
         indices: (B, 2, K) long tensor on same device as cost_matrix,
@@ -592,14 +593,19 @@ def sinkhorn_matcher(
     # Hard assignment: argmax per row extracts initial permutation.
     column_indices = log_transport.argmax(dim=2)  # (B, N)
 
-    # Phase 2: Resolve duplicate column assignments.
+    # Slice to matched size
+    column_indices = column_indices[:, :num_matched]
+
+    # Phase 2 (optional): Resolve duplicate column assignments.
     # Sinkhorn with finite regularization may assign multiple rows to the
-    # same column. This would let the model cherry-pick easy targets and
-    # skip hard ones, corrupting the loss signal. The dedup step ensures
-    # every ground-truth track is matched exactly once.
-    column_indices = _resolve_duplicate_assignments(
-        column_indices[:, :num_matched], cost_matrix[:, :num_matched],
-    )
+    # same column. With deduplicate=True, the dedup step ensures every
+    # ground-truth track is matched exactly once (bijective).
+    # With deduplicate=False, raw argmax assignments are returned as-is
+    # (non-bijective — some columns may appear multiple times).
+    if deduplicate:
+        column_indices = _resolve_duplicate_assignments(
+            column_indices, cost_matrix[:, :num_matched],
+        )
 
     row_indices = torch.arange(
         num_matched, device=cost_matrix.device,
