@@ -242,15 +242,28 @@ class MaskedTrackPretrainer(nn.Module):
         backbone_kwargs: Keyword arguments for EnrichCompactBackbone.
         decoder_kwargs: Keyword arguments for MaskedTrackDecoder.
         mask_ratio: Fraction of tracks to mask (default: 0.4).
+        train_matcher: Matching algorithm for training assignment.
+            'hungarian' — exact optimal (scipy CPU, ~50ms overhead).
+            'sinkhorn' — approximate (GPU-native, non-bijective).
+            Validation always uses exact Hungarian for honest metrics.
     """
+
+    VALID_MATCHERS = ('hungarian', 'sinkhorn')
 
     def __init__(
         self,
         backbone_kwargs: dict | None = None,
         decoder_kwargs: dict | None = None,
         mask_ratio: float = 0.4,
+        train_matcher: str = 'hungarian',
     ):
         super().__init__()
+
+        if train_matcher not in self.VALID_MATCHERS:
+            raise ValueError(
+                f'train_matcher must be one of {self.VALID_MATCHERS}, '
+                f'got {train_matcher!r}'
+            )
 
         if backbone_kwargs is None:
             backbone_kwargs = {}
@@ -258,6 +271,7 @@ class MaskedTrackPretrainer(nn.Module):
             decoder_kwargs = {}
 
         self.mask_ratio = mask_ratio
+        self.train_matcher = train_matcher
 
         self.backbone = EnrichCompactBackbone(**backbone_kwargs)
 
@@ -457,20 +471,17 @@ class MaskedTrackPretrainer(nn.Module):
         )
 
         # Optimal assignment: find best 1-to-1 matching (no gradients).
-        # Training: raw Sinkhorn (GPU-native, no dedup). Non-bijective —
-        #   multiple predictions can match the same target. This lets the
-        #   model cherry-pick easy targets first (lower train loss), but
-        #   the gradient signal is smooth and fully on-GPU.
-        # Validation: exact Hungarian (scipy CPU, bijective). Gives the
-        #   true optimal 1-to-1 assignment cost — honest metric with no
-        #   cherry-picking.
+        # Validation always uses exact Hungarian for honest metrics.
+        # Training matcher is configurable via self.train_matcher:
+        #   'hungarian' — exact optimal (scipy CPU, bijective)
+        #   'sinkhorn'  — approximate (GPU-native, non-bijective)
         # indices: (B, 2, K) — indices[:, 0] = predicted slot, indices[:, 1] = true slot
-        if self.training:
+        if not self.training or self.train_matcher == 'hungarian':
+            indices = hungarian_matcher(cost_matrix.detach())
+        else:
             indices = sinkhorn_matcher(
                 cost_matrix.detach(), deduplicate=False,
             )
-        else:
-            indices = hungarian_matcher(cost_matrix.detach())
         matched_pred_indices = indices[:, 0, :]  # (B, K)
         matched_true_indices = indices[:, 1, :]  # (B, K)
 
