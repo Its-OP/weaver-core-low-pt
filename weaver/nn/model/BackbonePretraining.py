@@ -25,20 +25,20 @@ The decoder is discarded after pretraining. Only the backbone is kept.
 MaskedTrackPretrainer.forward() returns (B,) per-event loss tensor.
 The custom training script (pretrain_backbone.py) calls .mean().backward().
 
-Design note on decoder simplicity:
-    The decoder is intentionally minimal — just cross-attention + output MLP.
-    No self-attention among masked queries, no (η, φ) positional encoding.
-    This prevents the decoder from bypassing the backbone:
+Design note on decoder:
+    The decoder uses DETR-style stacked transformer decoder layers
+    (self-attention → cross-attention → FFN), with learnable index
+    embeddings as queries (no (η, φ) positional encoding).
 
-    Problem: With (η, φ) PE + self-attention, the decoder can learn spatial
-    statistics (local density, typical momentum at a position) from the
-    masked queries alone, without needing the backbone. This causes the loss
-    to plateau at ~0.75 (the positional-encoding floor) with zero gradient
-    pressure on the backbone.
+    Learnable index embeddings carry zero physics information — particle
+    sets are permutation-invariant, so index 0 vs index 1 has no physical
+    meaning. The only way for queries to access event-specific information
+    is through cross-attention to backbone tokens, which forces the backbone
+    to encode useful representations.
 
-    Fix: Learnable index embeddings (no physics info) differentiate queries,
-    and cross-attention is the ONLY way to access event-specific information.
-    This forces the backbone to encode useful representations.
+    The number of decoder layers is configurable (default: 1). With multiple
+    layers, self-attention among queries helps coordinate predictions to
+    avoid duplicates (standard in DETR-family models).
 """
 import torch
 import torch.nn as nn
@@ -49,39 +49,32 @@ from weaver.nn.model.hungarian_matcher import sinkhorn_matcher
 
 
 class MaskedTrackDecoder(nn.Module):
-    """Minimal decoder for masked track reconstruction.
+    """DETR-style decoder for masked track reconstruction.
 
-    Intentionally simple to prevent decoder shortcut / backbone bypass.
-    The decoder must extract ALL event-specific information from the
-    backbone tokens via cross-attention — it has no other source.
+    Uses stacked transformer decoder layers (self-attention → cross-attention
+    → FFN) to predict masked track features from backbone tokens.
 
     Architecture:
-        1. Learnable query embeddings (physics-free query differentiation)
-        2. Cross-attention: masked track queries attend to backbone tokens
-        3. Output MLP: project cross-attention output → predicted features
+        1. Learnable query embeddings (physics-free slot differentiation)
+        2. Backbone projection + LayerNorm (project backbone tokens to
+           decoder dimension with stable scale)
+        3. N stacked TransformerDecoderLayers, each containing:
+           - Self-attention among queries (coordinate predictions, avoid
+             duplicates — standard in DETR-family models)
+           - Cross-attention to backbone tokens (sole event-specific
+             information source)
+           - Feedforward network (4× expansion, GELU activation)
+           All with pre-norm (LayerNorm before attention) for stability.
+        4. Output MLP: project decoded queries → predicted features
 
-    Why learnable query embeddings (not shared token + noise):
+    Why learnable query embeddings (not positional encoding):
         Each masked query needs a distinct embedding so that after W_Q
         projection, different queries produce different attention patterns
-        over the 64 backbone tokens. A shared token + noise approach fails
-        because the noise gets attenuated through W_Q projection and
-        dot-product with keys: for decoder_dim=128 with 4 heads (d_head=32),
-        achieving O(1) logit variation would require noise_std ≈ 6 — large
-        enough to drown the token itself. Learnable embeddings avoid this
-        by having proper scale from the start (initialized at std=1/√d).
-
-    Why no (η, φ) positional encoding:
-        Sinusoidal PE from (η, φ) leaks spatial information into queries.
-        Combined with self-attention, this lets the decoder learn spatial
-        statistics (density, typical pT at a position) without the backbone.
-        Learnable index embeddings only differentiate queries — they carry
-        zero physics information since particle sets are permutation-invariant.
-
-    Why no self-attention among masked queries:
-        Self-attention lets ~450 masked queries exchange positional info,
-        creating an information pathway that bypasses the backbone entirely.
-        Without it, each query independently cross-attends to backbone
-        tokens, forcing the backbone to be the sole information source.
+        over the backbone tokens. These embeddings carry zero physics
+        information — particle sets are permutation-invariant, so index 0
+        vs index 1 has no physical meaning. The only way for a query to
+        access event-specific information is through cross-attention to
+        backbone tokens, which forces the backbone to be the sole encoder.
 
     Note: We only reconstruct pf_features (standardized by weaver), not
     pf_vectors (raw 4-momenta). The 4-vectors (px, py, pz, E) are fully
@@ -91,12 +84,15 @@ class MaskedTrackDecoder(nn.Module):
     Args:
         backbone_dim: Channel dimension of backbone tokens (default: 256).
         decoder_dim: Internal dimension of the decoder (default: 128).
-        num_heads: Number of cross-attention heads (default: 4).
+        num_heads: Number of attention heads (default: 4).
+        num_decoder_layers: Number of stacked TransformerDecoderLayers
+            (default: 1). More layers give queries more capacity to
+            coordinate and refine predictions.
         num_output_features: Number of track features to reconstruct (default: 7).
         max_masked_tracks: Maximum number of masked tracks (vocab size for
             query embeddings). Must be >= mask_ratio × max_tracks_per_event.
             Default: 1200 (supports 0.4 × 2800 = 1120 masked tracks).
-        dropout: Dropout rate in cross-attention (default: 0.0).
+        dropout: Dropout rate in attention layers (default: 0.0).
     """
 
     def __init__(
@@ -104,6 +100,7 @@ class MaskedTrackDecoder(nn.Module):
         backbone_dim: int = 256,
         decoder_dim: int = 128,
         num_heads: int = 4,
+        num_decoder_layers: int = 1,
         num_output_features: int = 7,
         max_masked_tracks: int = 1200,
         dropout: float = 0.0,
@@ -124,7 +121,7 @@ class MaskedTrackDecoder(nn.Module):
         self.query_embeddings = nn.Embedding(max_masked_tracks, decoder_dim)
         nn.init.normal_(self.query_embeddings.weight, std=decoder_dim ** -0.5)
 
-        # LayerNorm on queries and keys before cross-attention.
+        # LayerNorm on queries and memory before the decoder stack.
         # Attention logits = (Q·K^T)/√d_head require Q and K at comparable
         # scales for non-degenerate softmax. Without normalization:
         #   - At init: backbone output std ≈ 0.05, queries std ≈ 0.09
@@ -138,19 +135,27 @@ class MaskedTrackDecoder(nn.Module):
         # Project backbone tokens to decoder dimension
         self.backbone_projection = nn.Linear(backbone_dim, decoder_dim)
 
-        # Cross-attention: masked queries attend to backbone tokens.
-        # This is the ONLY way event-specific information enters the decoder.
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=decoder_dim,
-            num_heads=num_heads,
+        # Stacked DETR-style decoder layers.
+        # Each layer: self-attention → cross-attention → FFN
+        # Pre-norm (norm_first=True) for training stability.
+        # dim_feedforward = 4 × decoder_dim (standard transformer expansion).
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=decoder_dim,
+            nhead=num_heads,
+            dim_feedforward=decoder_dim * 4,
             dropout=dropout,
+            activation='gelu',
             batch_first=True,
+            norm_first=True,
         )
-        self.cross_attention_norm = nn.LayerNorm(decoder_dim)
+        self.transformer_decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=num_decoder_layers,
+        )
 
-        # Output MLP: cross-attention output → predicted features.
+        # Output MLP: decoded queries → predicted features.
         # One hidden layer with GELU provides enough capacity to decode
-        # backbone representations into 7 output features, without being
+        # backbone representations into output features, without being
         # so powerful that it can memorize patterns independently.
         self.output_mlp = nn.Sequential(
             nn.Linear(decoder_dim, decoder_dim),
@@ -189,25 +194,24 @@ class MaskedTrackDecoder(nn.Module):
         # LayerNorm ensures query scale matches key scale for well-scaled
         # attention logits from the start of training.
         query_indices = torch.arange(
-            num_masked_tracks, device=device
+            num_masked_tracks, device=device,
         )  # (N_masked,)
         queries = self.query_norm(
-            self.query_embeddings(query_indices)
+            self.query_embeddings(query_indices),
         )  # (N_masked, decoder_dim)
         queries = queries.unsqueeze(0).expand(
-            batch_size, -1, -1
+            batch_size, -1, -1,
         )  # (B, N_masked, decoder_dim)
 
-        # Cross-attention: each masked query independently attends to
-        # backbone tokens. This is the sole information pathway from
-        # the encoder — no self-attention, no positional encoding leak.
-        cross_attention_output, _ = self.cross_attention(
-            query=queries, key=memory, value=memory
-        )
-        queries = self.cross_attention_norm(queries + cross_attention_output)
+        # Stacked decoder layers: self-attention among queries (coordinate
+        # predictions) + cross-attention to backbone tokens (event-specific
+        # information). Each layer refines query representations.
+        decoded = self.transformer_decoder(
+            tgt=queries, memory=memory,
+        )  # (B, N_masked, decoder_dim)
 
         # Output MLP: (B, N_masked, decoder_dim) → (B, N_masked, F)
-        predictions = self.output_mlp(queries)
+        predictions = self.output_mlp(decoded)
 
         # Transpose to (B, num_output_features, N_masked)
         return predictions.transpose(1, 2)
