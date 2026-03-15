@@ -493,8 +493,8 @@ class TauTrackFinder(nn.Module):
         # Clamp costs to prevent inf/NaN in the cost matrix.
         # logsigmoid can produce very negative values (e.g., -100 for logits of -100),
         # and -logsigmoid can be very large. Clamp to a finite maximum.
-        pointer_cost = pointer_cost.clamp(max=100.0)
-        confidence_cost = confidence_cost.clamp(max=100.0)
+        pointer_cost = torch.nan_to_num(pointer_cost, nan=50.0, posinf=100.0).clamp(max=100.0)
+        confidence_cost = torch.nan_to_num(confidence_cost, nan=50.0, posinf=100.0).clamp(max=100.0)
 
         # Combined cost
         cost_matrix = pointer_cost + confidence_cost
@@ -587,9 +587,13 @@ class TauTrackFinder(nn.Module):
                     query_mask_logits, gt_binary_mask,
                 )
 
-                # Compute focal BCE loss for this query-GT pair
+                # Compute focal BCE loss for this query-GT pair.
+                # Only include valid (non-padded) tracks to avoid NaN from
+                # BCE(-inf, 0) which produces NaN on MPS/some backends.
+                valid_track_mask = mask[batch_index].squeeze(0).bool()  # (P,)
                 total_focal_bce_loss = total_focal_bce_loss + self._focal_bce_loss(
-                    query_mask_logits, gt_binary_mask,
+                    query_mask_logits[valid_track_mask],
+                    gt_binary_mask[valid_track_mask],
                 )
 
                 num_matched_total += 1
@@ -642,6 +646,7 @@ class TauTrackFinder(nn.Module):
         denoising_mask_targets: torch.Tensor,
         denoising_confidence_targets: torch.Tensor,
         denoising_valid_mask: torch.Tensor,
+        track_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute losses for denoising queries (no Hungarian matching needed).
 
@@ -688,9 +693,17 @@ class TauTrackFinder(nn.Module):
                 total_dice_loss = total_dice_loss + self._dice_loss(
                     query_mask_logits, query_mask_targets,
                 )
-                total_focal_bce_loss = total_focal_bce_loss + self._focal_bce_loss(
-                    query_mask_logits, query_mask_targets,
-                )
+                # Exclude padded tracks to avoid NaN from BCE(-inf, 0)
+                if track_mask is not None:
+                    valid_tracks = track_mask[batch_index].squeeze(0).bool()
+                    total_focal_bce_loss = total_focal_bce_loss + self._focal_bce_loss(
+                        query_mask_logits[valid_tracks],
+                        query_mask_targets[valid_tracks],
+                    )
+                else:
+                    total_focal_bce_loss = total_focal_bce_loss + self._focal_bce_loss(
+                        query_mask_logits, query_mask_targets,
+                    )
                 num_valid_total += 1
 
         # Average over valid denoising queries
@@ -818,6 +831,7 @@ class TauTrackFinder(nn.Module):
             num_learnable = self.head.num_queries
             num_layers = len(all_layer_mask_logits)
 
+
             # Accumulate losses across all decoder layers (auxiliary losses)
             accumulated_dice_loss = torch.tensor(0.0, device=enriched_features.device)
             accumulated_focal_bce_loss = torch.tensor(0.0, device=enriched_features.device)
@@ -844,6 +858,7 @@ class TauTrackFinder(nn.Module):
                 accumulated_focal_bce_loss = accumulated_focal_bce_loss + layer_losses['mask_focal_bce_loss']
                 accumulated_confidence_loss = accumulated_confidence_loss + layer_losses['confidence_loss']
 
+
             # Average across layers (uniform layer weighting)
             averaged_dice_loss = accumulated_dice_loss / num_layers
             averaged_focal_bce_loss = accumulated_focal_bce_loss / num_layers
@@ -861,6 +876,7 @@ class TauTrackFinder(nn.Module):
                 denoising_mask_targets,
                 denoising_confidence_targets,
                 denoising_valid_mask,
+                track_mask=mask,
             )
 
             # Weighted denoising loss
