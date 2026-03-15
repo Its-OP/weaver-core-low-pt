@@ -316,17 +316,23 @@ class TauTrackFinderHead(nn.Module):
         # ---- Confidence Head ----
         # Per-query binary prediction: does this query point to a real tau
         # track (exists) or is it an unused slot (empty / no-object)?
-        # Simplified: uses only the decoded query representation, no pointed
-        # context. The dual cross-attention to enriched tracks provides
-        # sufficient track-identity information directly in the query.
         #
-        # confidence = Linear(128 -> 1, bias)(GELU(Linear(decoder_dim -> 128)))
+        # Input: [decoded_query, pointed_context] of dimension 2 * decoder_dim.
+        #   - decoded_query (decoder_dim): the query's learned representation
+        #     from self-attention + cross-attention in the decoder.
+        #   - pointed_context (decoder_dim): soft attention readout of track
+        #     features weighted by mask probabilities. This tells the confidence
+        #     head WHAT the query is pointing at (tau-like vs background features).
+        #     Computed with detached mask_logits so confidence loss does not
+        #     interfere with the mask scoring path.
+        #
+        # confidence = Linear(128 -> 1, bias)(GELU(Linear(2*decoder_dim -> 128)))
         #
         # Bias initialization: with 30 queries and typically ~3 active (~10%),
         # init to logit(0.2) = ln(0.2 / 0.8) ~ -1.4 so the network starts
         # predicting low confidence for most queries.
         self.confidence_head = nn.Sequential(
-            nn.Linear(decoder_dim, 128),
+            nn.Linear(2 * decoder_dim, 128),
             nn.GELU(),
             nn.Linear(128, 1),
         )
@@ -499,10 +505,33 @@ class TauTrackFinderHead(nn.Module):
                 pointer_padding_mask, float('-inf'),
             )
 
-            # Compute confidence logits
-            # confidence_head: Linear(decoder_dim -> 128) -> GELU -> Linear(128 -> 1)
+            # Compute mask-informed confidence logits
+            # Step 1: soft attention readout of track features using mask probs.
+            # pointed_context = softmax(mask_logits) @ track_memory
+            # This encodes the enriched features of the track(s) each query
+            # is pointing at, giving the confidence head direct information
+            # about the quality and identity of the selected track.
+            #
+            # detach mask_logits so confidence loss does NOT backpropagate
+            # through the mask scoring path (query_scoring_mlp, track_key_mlp,
+            # temperature). The confidence loss still flows through queries
+            # and track_memory via the pointed_context computation.
+            mask_probabilities = torch.softmax(
+                mask_logits.detach(), dim=-1,
+            )  # (B, total_queries, P): padded positions get 0 from softmax(-inf)
+            pointed_context = torch.bmm(
+                mask_probabilities, track_memory,
+            )  # (B, total_queries, decoder_dim)
+
+            # Step 2: concatenate decoded query + pointed context
+            # confidence_input = [query_representation, what_it_points_at]
+            confidence_input = torch.cat(
+                [queries, pointed_context], dim=-1,
+            )  # (B, total_queries, 2 * decoder_dim)
+
+            # Step 3: confidence_head: Linear(2*decoder_dim -> 128) -> GELU -> Linear(128 -> 1)
             confidence_logits = self.confidence_head(
-                queries,
+                confidence_input,
             ).squeeze(-1)  # (B, total_queries)
 
             all_layer_mask_logits.append(mask_logits)
