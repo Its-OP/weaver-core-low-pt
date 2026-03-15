@@ -18,6 +18,8 @@ Loss components:
     - Hungarian matching (Kuhn, 1955):
         Optimal 1-to-1 assignment of queries to GT tracks (no gradients).
         Reuses existing hungarian_matcher from weaver.
+        Cost matrix uses bounded 1 - P formulation (not -log P) for
+        stable matching early in training when P ≈ 1/N_tracks.
 
 References:
     DETR: https://arxiv.org/abs/2005.12872
@@ -137,7 +139,17 @@ class TauTrackFinder(nn.Module):
     ) -> torch.Tensor:
         """Build cost matrix (B, num_queries, max_gt_tracks) for Hungarian matching.
 
-        Cost = λ_ptr × (-log P(query → GT track)) + λ_conf × (-log P(exists))
+        Uses bounded costs for stable matching, especially early in training
+        when pointer probabilities are near-uniform across ~2000 tracks.
+
+        Cost = λ_ptr × (1 - P(query → GT track)) + λ_conf × (1 - P(exists))
+
+        Both terms are bounded in [0, 1], unlike the original -log P formulation
+        which produces near-identical large values (~7.6) when probabilities
+        are uniform, making early matching effectively random.
+
+        Reference: DETR (Carion et al., ECCV 2020) uses bounded L1 + GIoU
+        costs rather than -log P for the same stability reason.
 
         Args:
             pointer_logits: (B, num_queries, P) pointer scores.
@@ -164,20 +176,26 @@ class TauTrackFinder(nn.Module):
             -1, num_queries, -1,
         )  # (B, num_queries, max_gt)
 
-        pointer_cost = -torch.log(
-            pointer_probabilities.gather(2, gt_indices_expanded).clamp(min=1e-8)
-        )  # (B, num_queries, max_gt): -log P(query q → GT track g)
+        # Bounded pointer cost: 1 - P(query → GT track), in [0, 1]
+        # When P = 1 (perfect match) → cost = 0
+        # When P ≈ 0 (no match) → cost ≈ 1
+        # Unlike -log P which gives ≈7.6 for all queries early in training,
+        # this provides a meaningful gradient signal from the start.
+        gathered_probabilities = pointer_probabilities.gather(
+            2, gt_indices_expanded,
+        )  # (B, num_queries, max_gt)
+        pointer_cost = 1.0 - gathered_probabilities
 
-        # Confidence cost: -log P(query exists)
-        # σ(confidence_logits) = P(exists)
+        # Bounded confidence cost: 1 - σ(confidence_logits), in [0, 1]
+        # σ(logit) = P(exists). Cost = 0 when confident, cost = 1 when not.
         confidence_probability = torch.sigmoid(confidence_logits)  # (B, num_queries)
-        confidence_cost = -torch.log(
-            confidence_probability.clamp(min=1e-8)
+        confidence_cost = (
+            1.0 - confidence_probability
         ).unsqueeze(2).expand(
             -1, -1, self.max_gt_tracks,
         )  # (B, num_queries, max_gt)
 
-        # Combined cost
+        # Combined cost: both terms in [0, 1], equally weighted
         cost_matrix = pointer_cost + confidence_cost
 
         # Set cost to large value for invalid GT slots (gt_index == -1)
