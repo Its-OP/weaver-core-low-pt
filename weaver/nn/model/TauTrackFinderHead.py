@@ -1,32 +1,23 @@
-"""DETR-style encoder-decoder head for tau-origin track finding.
+"""DETR-style decoder head for tau-origin track finding.
 
-Architecture follows DETR (Carion et al., ECCV 2020) with a dual
-cross-attention extension in the decoder:
+Minimal architecture: queries cross-attend to enriched per-track features,
+then score tracks via dot-product mask logits. No compact token encoder,
+no denoising, no auxiliary losses — just the core decoder.
 
-    1. Compact Token Encoder: self-attention on 128 compact tokens from the
-       backbone, capturing global event context.
-    2. Query Decoder: queries cross-attend to BOTH encoded compact tokens
-       (global event context) AND enriched per-track features (fine-grained
-       track identity) via DualCrossAttentionDecoderLayer.
-    3. Mask Head: dot-product scoring between decoded queries and per-track
-       enriched features, with a learned temperature parameter.
-    4. Confidence Head: per-query binary prediction (exists / empty).
-    5. Auxiliary losses at every decoder layer for deep supervision.
+Architecture:
+    1. Query Initialization: FPS in (eta, phi) → project to decoder space
+    2. Decoder: N layers of [self-attention → track cross-attention → FFN]
+    3. Mask Head: dot-product scoring between decoded queries and track keys,
+       with a learned temperature parameter
+    4. Confidence Head: per-query binary exists/empty prediction
 
-Queries are initialized via Farthest Point Sampling (FPS) from enriched
-track features rather than learned embeddings, providing spatially diverse
-starting points in (eta, phi) space.
-
-The backbone is external -- this module only receives backbone outputs
-(enriched features and compact tokens) and produces mask logits and
-confidence logits. Loss computation is handled by TauTrackFinder.
+The backbone is external — this module only receives enriched per-track
+features and produces mask logits + confidence logits. Loss computation
+is handled by TauTrackFinder.
 
 References:
     Carion, N. et al. "End-to-End Object Detection with Transformers."
     ECCV 2020. https://arxiv.org/abs/2005.12872
-
-    Cheng, B. et al. "Masked-attention Mask Transformer for Universal
-    Image Segmentation." CVPR 2022. (Mask2Former -- dual cross-attention)
 """
 import torch
 import torch.nn as nn
@@ -34,85 +25,21 @@ import torch.nn as nn
 from weaver.nn.model.HierarchicalGraphBackbone import farthest_point_sampling
 
 
-class DropPath(nn.Module):
-    """Stochastic depth: randomly skip a layer's contribution during training.
+class DecoderLayer(nn.Module):
+    """Standard transformer decoder layer with 3 sublayers (post-norm).
 
-    Implements the residual-scaling variant of stochastic depth from
-    Huang et al., "Deep Networks with Stochastic Depth", ECCV 2016.
+    Sublayers:
+        1. Self-attention among queries (prevents duplicate predictions)
+        2. Cross-attention: queries → enriched per-track features
+        3. Feed-forward network
 
-    During training, the layer's residual delta (output - input) is either
-    passed through with probability (1 - drop_probability) and scaled by
-    1 / (1 - drop_probability) to preserve expected values, or zeroed out
-    with probability drop_probability (effectively skipping the layer).
-
-    The scaling ensures that:
-        E[DropPath(delta)] = delta
-    so the expected output is the same at train and eval time.
-
-    During evaluation, the delta is always passed through unchanged
-    (no dropout, no scaling).
-
-    Args:
-        drop_probability: Probability of dropping this layer's contribution.
-            Must be in [0, 1). Default: 0.0 (no dropout).
-    """
-
-    def __init__(self, drop_probability: float = 0.0):
-        super().__init__()
-        self.drop_probability = drop_probability
-
-    def forward(self, layer_delta: torch.Tensor) -> torch.Tensor:
-        """Apply stochastic depth to the layer's residual delta.
-
-        Args:
-            layer_delta: (B, num_queries, decoder_dim) difference between
-                decoder layer output and its input (the layer's contribution).
-
-        Returns:
-            Scaled or zeroed delta with same shape as input.
-        """
-        if not self.training or self.drop_probability == 0.0:
-            return layer_delta
-
-        keep_probability = 1.0 - self.drop_probability
-        # Binary mask: shape (batch_size, 1, 1) broadcasts across
-        # sequence length and feature dimensions.
-        # Each sample in the batch independently decides to keep or drop.
-        random_mask = torch.rand(
-            layer_delta.shape[0], 1, 1,
-            device=layer_delta.device,
-            dtype=layer_delta.dtype,
-        )
-        # Bernoulli mask: 1 if rand < keep_prob, else 0
-        random_mask = (random_mask < keep_probability).float()
-
-        # Scale surviving outputs by 1/keep_probability so that:
-        #   E[output] = keep_prob * (delta / keep_prob) + drop_prob * 0 = delta
-        return layer_delta * random_mask / keep_probability
-
-    def extra_repr(self) -> str:
-        return f'drop_probability={self.drop_probability:.3f}'
-
-
-class DualCrossAttentionDecoderLayer(nn.Module):
-    """Decoder layer with dual cross-attention to compact tokens and tracks.
-
-    Each layer has 4 sublayers (all post-norm, following original DETR):
-        1. Self-attention among queries (coordination to avoid duplicates)
-        2. Cross-attention: queries -> encoded compact tokens (global context)
-        3. Cross-attention: queries -> enriched per-track features (track identity)
-        4. Feed-forward network (two linear layers with GELU)
-
-    Post-norm (norm_first=False) applies LayerNorm AFTER each residual addition,
-    bounding representation norms across layers. Pre-norm was found to cause
-    query norms to explode from ~1 to ~598 across 6 layers, making
-    cross-attention contributions negligible (<0.2% of residual norm).
+    All sublayers use post-norm: output = LayerNorm(sublayer(x) + x)
 
     Args:
         decoder_dim: Dimension of query, key, and value vectors.
-        num_heads: Number of attention heads in each MultiheadAttention.
-        dim_feedforward: Hidden dimension of the feed-forward network.
-        dropout: Dropout rate applied in attention and FFN.
+        num_heads: Number of attention heads.
+        dim_feedforward: Hidden dimension of the FFN.
+        dropout: Dropout rate in attention and FFN.
     """
 
     def __init__(
@@ -124,8 +51,7 @@ class DualCrossAttentionDecoderLayer(nn.Module):
     ):
         super().__init__()
 
-        # Sublayer 1: Self-attention among queries for coordination
-        # Prevents multiple queries from converging to the same track.
+        # Sublayer 1: Self-attention among queries
         self.self_attention = nn.MultiheadAttention(
             embed_dim=decoder_dim,
             num_heads=num_heads,
@@ -133,150 +59,95 @@ class DualCrossAttentionDecoderLayer(nn.Module):
             batch_first=True,
         )
 
-        # Sublayer 2: Cross-attention to encoded compact tokens
-        # Queries attend to 128 compact spatial tokens for global event context.
-        self.compact_cross_attention = nn.MultiheadAttention(
+        # Sublayer 2: Cross-attention to enriched per-track features
+        # Queries attend to ~1130 track features for fine-grained identity.
+        # key_padding_mask ignores padded track positions.
+        self.cross_attention = nn.MultiheadAttention(
             embed_dim=decoder_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
 
-        # Sublayer 3: Cross-attention to enriched per-track features
-        # Queries attend to ~1130 enriched track features for fine-grained
-        # track identity information. Uses track_padding_mask to ignore
-        # padded track positions.
-        self.track_cross_attention = nn.MultiheadAttention(
-            embed_dim=decoder_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        # Sublayer 4: Feed-forward network
+        # Sublayer 3: Feed-forward network
         # FFN(x) = Linear_2(GELU(Linear_1(x)))
-        # Expands to dim_feedforward then projects back to decoder_dim.
-        self.ffn = nn.Sequential(
+        self.feed_forward_network = nn.Sequential(
             nn.Linear(decoder_dim, dim_feedforward),
             nn.GELU(),
             nn.Linear(dim_feedforward, decoder_dim),
         )
 
-        # Post-norm: LayerNorm applied AFTER residual addition at each sublayer
-        # output = LayerNorm(sublayer(x) + x)
-        self.norm1 = nn.LayerNorm(decoder_dim)
-        self.norm2 = nn.LayerNorm(decoder_dim)
-        self.norm3 = nn.LayerNorm(decoder_dim)
-        self.norm4 = nn.LayerNorm(decoder_dim)
+        # Post-norm: LayerNorm AFTER residual addition
+        self.norm_self_attention = nn.LayerNorm(decoder_dim)
+        self.norm_cross_attention = nn.LayerNorm(decoder_dim)
+        self.norm_feed_forward = nn.LayerNorm(decoder_dim)
 
-        # Dropout for residual connections
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-        self.dropout4 = nn.Dropout(dropout)
+        self.dropout_self_attention = nn.Dropout(dropout)
+        self.dropout_cross_attention = nn.Dropout(dropout)
+        self.dropout_feed_forward = nn.Dropout(dropout)
 
     def forward(
         self,
         queries: torch.Tensor,
-        compact_memory: torch.Tensor,
         track_memory: torch.Tensor,
-        self_attention_mask: torch.Tensor | None = None,
         track_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass through all 4 sublayers.
+        """Forward pass through 3 sublayers.
 
         Args:
             queries: (B, num_queries, decoder_dim) query embeddings.
-            compact_memory: (B, 128, decoder_dim) encoded compact tokens.
-            track_memory: (B, P, decoder_dim) enriched per-track features
-                projected to decoder space.
-            self_attention_mask: (total_queries, total_queries) or None.
-                Boolean attention mask for self-attention. True = ignore.
-                Used for denoising training to prevent information leaking
-                between learnable and denoising query groups.
-            track_padding_mask: (B, P) or None. Boolean key padding mask
-                for track cross-attention. True = padded (ignore).
+            track_memory: (B, P, decoder_dim) projected track features.
+            track_padding_mask: (B, P) boolean, True = padded (ignore).
 
         Returns:
-            queries: (B, num_queries, decoder_dim) updated query embeddings.
+            queries: (B, num_queries, decoder_dim) updated queries.
         """
-        # Sublayer 1: Self-attention among queries
+        # Sublayer 1: Self-attention
         # output = LayerNorm(dropout(SelfAttn(Q, Q, Q)) + Q)
         self_attention_output, _ = self.self_attention(
-            query=queries,
-            key=queries,
-            value=queries,
-            attn_mask=self_attention_mask,
+            query=queries, key=queries, value=queries,
         )
-        queries = self.norm1(queries + self.dropout1(self_attention_output))
-
-        # Sublayer 2: Cross-attention to compact tokens (global context)
-        # output = LayerNorm(dropout(CrossAttn(Q, K_compact, V_compact)) + Q)
-        compact_cross_output, _ = self.compact_cross_attention(
-            query=queries,
-            key=compact_memory,
-            value=compact_memory,
+        queries = self.norm_self_attention(
+            queries + self.dropout_self_attention(self_attention_output),
         )
-        queries = self.norm2(queries + self.dropout2(compact_cross_output))
 
-        # Sublayer 3: Cross-attention to enriched tracks (fine-grained identity)
+        # Sublayer 2: Cross-attention to track features
         # output = LayerNorm(dropout(CrossAttn(Q, K_track, V_track)) + Q)
-        # track_padding_mask: (B, P) where True = padded positions to ignore
-        track_cross_output, _ = self.track_cross_attention(
+        cross_attention_output, _ = self.cross_attention(
             query=queries,
             key=track_memory,
             value=track_memory,
             key_padding_mask=track_padding_mask,
         )
-        queries = self.norm3(queries + self.dropout3(track_cross_output))
+        queries = self.norm_cross_attention(
+            queries + self.dropout_cross_attention(cross_attention_output),
+        )
 
-        # Sublayer 4: Feed-forward network
+        # Sublayer 3: FFN
         # output = LayerNorm(dropout(FFN(Q)) + Q)
-        ffn_output = self.ffn(queries)
-        queries = self.norm4(queries + self.dropout4(ffn_output))
+        feed_forward_output = self.feed_forward_network(queries)
+        queries = self.norm_feed_forward(
+            queries + self.dropout_feed_forward(feed_forward_output),
+        )
 
         return queries
 
 
 class TauTrackFinderHead(nn.Module):
-    """DETR-style encoder-decoder head with dual cross-attention for track finding.
+    """DETR decoder head for track finding.
 
-    Takes enriched per-track features and compact spatial tokens from
-    the backbone, processes them through a transformer encoder-decoder,
-    and produces mask logits (per-query soft assignment over all tracks)
-    and confidence logits (per-query exists/empty prediction).
-
-    Key differences from standard DETR decoder:
-        - Dual cross-attention: decoder attends to both compact tokens AND
-          enriched per-track features (inspired by Mask2Former).
-        - FPS query initialization: queries are seeded from spatially diverse
-          track features via Farthest Point Sampling in (eta, phi), rather
-          than learned embeddings. Provides input-dependent initialization.
-        - Auxiliary losses: mask and confidence predictions at every decoder
-          layer for deep supervision (following Mask2Former / DETR variants).
-        - Support for denoising training: additional noised queries can be
-          concatenated and processed alongside learnable queries.
+    Takes enriched per-track features from a frozen backbone, runs them
+    through a transformer decoder with cross-attention, and produces
+    mask logits and confidence logits for the last decoder layer only.
 
     Args:
         backbone_dim: Channel dimension of backbone outputs (default: 256).
-        decoder_dim: Internal dimension for encoder/decoder (default: 256).
+        decoder_dim: Internal decoder dimension (default: 256).
         mask_dim: Dimension for dot-product mask scoring (default: 128).
-        num_queries: Number of query embeddings (default: 30).
-            Increased from 15 for ranking-based inference.
-        num_heads: Number of attention heads in encoder/decoder (default: 8).
-        num_encoder_layers: Number of self-attention layers for compact
-            tokens (default: 6). Captures global event context.
-        num_decoder_layers: Number of dual cross-attention decoder layers
-            (default: 4). Reduced from 6 -- auxiliary losses at every layer
-            compensate for fewer layers.
-        dropout: Dropout rate in attention and feedforward layers (default: 0.1).
-        drop_path_rate: Maximum stochastic depth drop probability for the
-            last decoder layer (default: 0.0, disabled). Drop probabilities
-            increase linearly from 0 for the first decoder layer to
-            drop_path_rate for the last. Regularizes deep decoders by
-            randomly skipping layer contributions during training.
-            Reference: Huang et al., "Deep Networks with Stochastic Depth",
-            ECCV 2016.
+        num_queries: Number of FPS-initialized queries (default: 30).
+        num_heads: Attention heads per layer (default: 8).
+        num_decoder_layers: Number of decoder layers (default: 4).
+        dropout: Dropout rate (default: 0.1).
     """
 
     def __init__(
@@ -286,10 +157,8 @@ class TauTrackFinderHead(nn.Module):
         mask_dim: int = 128,
         num_queries: int = 30,
         num_heads: int = 8,
-        num_encoder_layers: int = 6,
         num_decoder_layers: int = 4,
         dropout: float = 0.1,
-        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         self.backbone_dim = backbone_dim
@@ -297,49 +166,16 @@ class TauTrackFinderHead(nn.Module):
         self.mask_dim = mask_dim
         self.num_queries = num_queries
 
-        # ---- Memory projection (compact tokens -> encoder input) ----
-        # Projects backbone compact tokens from backbone_dim to decoder_dim.
-        # LayerNorm stabilizes the scale for attention logits.
-        self.memory_projection = nn.Linear(backbone_dim, decoder_dim)
-        self.memory_norm = nn.LayerNorm(decoder_dim)
-
-        # ---- Compact Token Encoder ----
-        # Self-attention on 128 compact tokens to capture global event context
-        # before queries interact with them.
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=decoder_dim,
-            nhead=num_heads,
-            dim_feedforward=decoder_dim * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=False,  # Post-norm (original DETR, Carion et al., ECCV 2020):
-            # Pre-norm caused encoded compact tokens to have cross-event cosine
-            # similarity ~0.97, meaning only ~3% of the representation is
-            # event-specific. Post-norm bounds token norms after each residual
-            # addition, preserving input-dependent variation across layers.
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_encoder_layers,
-        )
-
-        # ---- Track projection (enriched features -> decoder cross-attention) ----
-        # Projects enriched per-track features to decoder_dim for the track
-        # cross-attention sublayer in DualCrossAttentionDecoderLayer.
+        # ---- Track projection (enriched features → decoder space) ----
         self.track_projection = nn.Linear(backbone_dim, decoder_dim)
         self.track_norm = nn.LayerNorm(decoder_dim)
 
-        # ---- Query projection (FPS-selected track features -> query space) ----
-        # Projects enriched features at FPS-selected seed indices into the
-        # decoder query space. Provides input-dependent query initialization.
+        # ---- Query projection (FPS seed features → decoder space) ----
         self.query_projection = nn.Linear(backbone_dim, decoder_dim)
 
-        # ---- Dual Cross-Attention Decoder Layers ----
-        # Each layer: self-attention -> compact cross-attention ->
-        # track cross-attention -> FFN. All post-norm.
+        # ---- Decoder layers ----
         self.decoder_layers = nn.ModuleList([
-            DualCrossAttentionDecoderLayer(
+            DecoderLayer(
                 decoder_dim=decoder_dim,
                 num_heads=num_heads,
                 dim_feedforward=decoder_dim * 4,
@@ -348,29 +184,9 @@ class TauTrackFinderHead(nn.Module):
             for _ in range(num_decoder_layers)
         ])
 
-        # ---- Stochastic Depth (DropPath) per decoder layer ----
-        # Drop probability increases linearly from 0 (first layer) to
-        # drop_path_rate (last layer):
-        #   p_i = drop_path_rate * i / (num_decoder_layers - 1)
-        # for i = 0, 1, ..., num_decoder_layers - 1.
-        # When num_decoder_layers == 1, the single layer gets rate 0.
-        # Applied to the layer's residual delta: queries_out - queries_in.
-        # Reference: Huang et al., "Deep Networks with Stochastic Depth", ECCV 2016.
-        per_layer_drop_rates = [
-            drop_path_rate * layer_index / max(num_decoder_layers - 1, 1)
-            for layer_index in range(num_decoder_layers)
-        ]
-        self.drop_paths = nn.ModuleList([
-            DropPath(drop_probability=rate)
-            for rate in per_layer_drop_rates
-        ])
-
         # ---- Track Key MLP ----
-        # Projects enriched per-track features (B, backbone_dim, P) to mask
-        # scoring key space (B, mask_dim, P) for dot-product scoring with
-        # decoded queries.
-        # Uses Conv1d (operates on channel dimension across tracks).
-        # track_key = BN(GELU(Conv1d(backbone_dim -> backbone_dim))) -> Conv1d(backbone_dim -> mask_dim)
+        # Projects enriched features to mask scoring key space
+        # track_key = BN(GELU(Conv1d(backbone_dim → backbone_dim))) → Conv1d(→ mask_dim)
         self.track_key_mlp = nn.Sequential(
             nn.Conv1d(backbone_dim, backbone_dim, kernel_size=1, bias=False),
             nn.BatchNorm1d(backbone_dim),
@@ -379,9 +195,8 @@ class TauTrackFinderHead(nn.Module):
         )
 
         # ---- Query Scoring MLP ----
-        # Projects decoded queries to mask scoring query space for dot-product
-        # scoring against track keys.
-        # query_score = LayerNorm(GELU(Linear(decoder_dim -> decoder_dim))) -> Linear(decoder_dim -> mask_dim)
+        # Projects decoded queries to mask scoring space
+        # query_score = LayerNorm(GELU(Linear(decoder_dim))) → Linear(→ mask_dim)
         self.query_scoring_mlp = nn.Sequential(
             nn.Linear(decoder_dim, decoder_dim),
             nn.GELU(),
@@ -390,253 +205,84 @@ class TauTrackFinderHead(nn.Module):
         )
 
         # ---- Learned Temperature ----
-        # Controls sharpness of softmax distribution over ~1130 tracks.
-        # score(query, key) = (query . key) / tau
-        # Learnable tau lets the model tune the trade-off between:
-        #   - Too flat (tau large): can't commit to a specific track
-        #   - Too sharp (tau small): gradients vanish for non-selected tracks
-        # Clamped to [0.1, 2.0]: min=0.1 prevents too-sharp distributions,
-        # max=2.0 prevents too-flat distributions that can't select tracks.
+        # score(query, key) = (query · key) / τ
+        # τ clamped to [0.1, 2.0] to prevent too-sharp or too-flat distributions.
         self.temperature = nn.Parameter(torch.ones(1))
 
         # ---- Confidence Head ----
-        # Per-query binary prediction: does this query point to a real tau
-        # track (exists) or is it an unused slot (empty / no-object)?
-        #
-        # Input: [decoded_query, pointed_context] of dimension 2 * decoder_dim.
-        #   - decoded_query (decoder_dim): the query's learned representation
-        #     from self-attention + cross-attention in the decoder.
-        #   - pointed_context (decoder_dim): soft attention readout of track
-        #     features weighted by mask probabilities. This tells the confidence
-        #     head WHAT the query is pointing at (tau-like vs background features).
-        #     Computed with detached mask_logits so confidence loss does not
-        #     interfere with the mask scoring path.
-        #
-        # confidence = Linear(128 -> 1, bias)(GELU(Linear(2*decoder_dim -> 128)))
-        #
-        # Bias initialization: with 30 queries and typically ~3 active (~10%),
-        # init to logit(0.2) = ln(0.2 / 0.8) ~ -1.4 so the network starts
-        # predicting low confidence for most queries.
+        # Per-query binary exists/empty prediction from decoded query only.
+        # confidence = Linear(128 → 1)(GELU(Linear(decoder_dim → 128)))
+        # Bias init: σ(-1.4) ≈ 0.198, matching prior ~10% active query rate.
         self.confidence_head = nn.Sequential(
-            nn.Linear(2 * decoder_dim, 128),
+            nn.Linear(decoder_dim, 128),
             nn.GELU(),
             nn.Linear(128, 1),
         )
-        # sigma(-1.4) ~ 0.198 ~ prior fraction of active queries
         nn.init.constant_(self.confidence_head[-1].bias, -1.4)
 
     def forward(
         self,
         enriched_features: torch.Tensor,
-        compact_tokens: torch.Tensor,
         mask: torch.Tensor,
         points: torch.Tensor,
-        num_denoising_queries: int = 0,
-        denoising_query_features: torch.Tensor | None = None,
-        denoising_attention_mask: torch.Tensor | None = None,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Forward pass: encode compact tokens, decode queries, score tracks.
-
-        Produces mask logits and confidence logits at every decoder layer
-        for auxiliary loss supervision (deep supervision).
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass: initialize queries, decode, score tracks.
 
         Args:
-            enriched_features: (B, backbone_dim, P) per-track enriched features
-                from backbone.enrich(). Used for mask scoring and track
-                cross-attention.
-            compact_tokens: (B, backbone_dim, 128) compact spatial tokens from
-                backbone.compact(). Used as encoder input / decoder memory.
+            enriched_features: (B, backbone_dim, P) from frozen backbone.
             mask: (B, 1, P) boolean mask, True for valid tracks.
-            points: (B, 2, P) coordinates in (eta, phi). Used for FPS query
-                initialization to select spatially diverse seed tracks.
-            num_denoising_queries: Number of denoising queries to append
-                (training only). Default: 0 (no denoising).
-            denoising_query_features: (B, num_denoising, backbone_dim) or None.
-                Pre-constructed denoising query inputs. Must be provided when
-                num_denoising_queries > 0.
-            denoising_attention_mask: (total_queries, total_queries) or None.
-                Boolean self-attention mask preventing information leaking
-                between learnable and denoising query groups. True = ignore.
-                Must be provided when num_denoising_queries > 0.
+            points: (B, 2, P) coordinates in (eta, phi) for FPS.
 
         Returns:
-            Tuple of:
-                all_layer_mask_logits: list of (B, total_queries, P) mask logits
-                    at each decoder layer. Padded positions are -inf.
-                    Length = num_decoder_layers.
-                all_layer_confidence_logits: list of (B, total_queries)
-                    confidence logits at each decoder layer (pre-sigmoid).
-                    Length = num_decoder_layers.
+            mask_logits: (B, num_queries, P) — padded positions are -inf.
+            confidence_logits: (B, num_queries) — pre-sigmoid.
         """
-        batch_size = enriched_features.shape[0]
+        # ---- Step 1: Track key projection for mask scoring ----
+        # (B, backbone_dim, P) → Conv1d → (B, mask_dim, P) → transpose → (B, P, mask_dim)
+        track_keys = self.track_key_mlp(enriched_features).transpose(1, 2)
 
-        # ------------------------------------------------------------------
-        # Step 1: Project enriched features to mask scoring key space
-        # ------------------------------------------------------------------
-        # track_key_mlp: Conv1d on (B, backbone_dim, P) -> (B, mask_dim, P)
-        # Transpose to (B, P, mask_dim) for dot-product with query projections.
-        track_keys = self.track_key_mlp(enriched_features)  # (B, mask_dim, P)
-        track_keys = track_keys.transpose(1, 2)  # (B, P, mask_dim)
-
-        # ------------------------------------------------------------------
-        # Step 2: Project enriched features to decoder cross-attention space
-        # ------------------------------------------------------------------
-        # (B, backbone_dim, P) -> transpose -> (B, P, backbone_dim) -> project
-        # -> (B, P, decoder_dim)
+        # ---- Step 2: Track memory projection for cross-attention ----
+        # (B, backbone_dim, P) → transpose → (B, P, backbone_dim) → Linear → (B, P, decoder_dim)
         track_memory = self.track_norm(
-            self.track_projection(enriched_features.transpose(1, 2))
-        )  # (B, P, decoder_dim)
+            self.track_projection(enriched_features.transpose(1, 2)),
+        )
 
-        # ------------------------------------------------------------------
-        # Step 3: Project and encode compact tokens
-        # ------------------------------------------------------------------
-        # (B, backbone_dim, 128) -> transpose -> (B, 128, backbone_dim) -> project
-        memory = self.memory_norm(
-            self.memory_projection(compact_tokens.transpose(1, 2))
-        )  # (B, 128, decoder_dim)
+        # ---- Step 3: FPS query initialization ----
+        # Select num_queries spatially diverse seed tracks in (eta, phi)
+        seed_indices = farthest_point_sampling(points, mask, self.num_queries)
 
-        # Self-attention encoder on compact tokens for global event context
-        encoded_memory = self.transformer_encoder(memory)  # (B, 128, decoder_dim)
-
-        # ------------------------------------------------------------------
-        # Step 4: Initialize queries via FPS from enriched features
-        # ------------------------------------------------------------------
-        # Farthest Point Sampling in (eta, phi) space selects num_queries
-        # spatially diverse seed track indices. The enriched features at
-        # these indices are projected into the decoder query space.
-        seed_indices = farthest_point_sampling(
-            points, mask, self.num_queries,
-        )  # (B, num_queries)
-
-        # Gather enriched features at seed indices
-        # seed_indices: (B, num_queries) -> (B, num_queries, 1) -> expand
-        # enriched_features: (B, backbone_dim, P) -> transpose -> (B, P, backbone_dim)
+        # Gather enriched features at seed indices → project to decoder space
         enriched_transposed = enriched_features.transpose(1, 2)  # (B, P, backbone_dim)
         seed_indices_expanded = seed_indices.unsqueeze(-1).expand(
             -1, -1, self.backbone_dim,
-        )  # (B, num_queries, backbone_dim)
-        seed_features = enriched_transposed.gather(
-            1, seed_indices_expanded,
-        )  # (B, num_queries, backbone_dim)
+        )
+        seed_features = enriched_transposed.gather(1, seed_indices_expanded)
+        queries = self.query_projection(seed_features)  # (B, num_queries, decoder_dim)
 
-        # Project seed features into decoder query space
-        learnable_queries = self.query_projection(
-            seed_features,
-        )  # (B, num_queries, decoder_dim)
-
-        # ------------------------------------------------------------------
-        # Step 5: Concatenate denoising queries (training only)
-        # ------------------------------------------------------------------
-        if num_denoising_queries > 0 and denoising_query_features is not None:
-            # Project denoising query features into decoder space
-            denoising_queries = self.query_projection(
-                denoising_query_features,
-            )  # (B, num_denoising, decoder_dim)
-
-            # Concatenate: [learnable_queries, denoising_queries]
-            all_queries = torch.cat(
-                [learnable_queries, denoising_queries], dim=1,
-            )  # (B, num_queries + num_denoising, decoder_dim)
-        else:
-            all_queries = learnable_queries  # (B, num_queries, decoder_dim)
-
-        # ------------------------------------------------------------------
-        # Step 6: Build track padding mask for cross-attention
-        # ------------------------------------------------------------------
-        # MultiheadAttention key_padding_mask: (B, S) where True = ignore
-        # mask: (B, 1, P) with True = valid -> invert for padding mask
+        # ---- Step 4: Padding masks ----
         track_padding_mask = ~mask.squeeze(1).bool()  # (B, P): True = padded
-
-        # ------------------------------------------------------------------
-        # Step 7: Build padding mask for pointer logits
-        # ------------------------------------------------------------------
-        # (B, 1, P) where True = padded, used to mask pointer logits with -inf
         pointer_padding_mask = ~mask.bool()  # (B, 1, P): True = padded
 
-        # Clamp temperature once (shared across all layers)
-        # tau clamped to [0.1, 2.0]:
-        #   min=0.1 prevents too-sharp distributions where logits explode
-        #     and cross-entropy gradients spike when the matching changes
-        #   max=2.0 prevents too-flat distributions that can't commit
-        #     to selecting specific tracks over ~1130 candidates
-        clamped_temperature = self.temperature.clamp(min=0.1, max=2.0)
-
-        # ------------------------------------------------------------------
-        # Step 8: Run through decoder layers with auxiliary outputs
-        # ------------------------------------------------------------------
-        all_layer_mask_logits = []
-        all_layer_confidence_logits = []
-
-        queries = all_queries
-        for layer_index, decoder_layer in enumerate(self.decoder_layers):
-            # Save queries before this layer for stochastic depth residual
-            previous_queries = queries
-
-            # Forward through DualCrossAttentionDecoderLayer
+        # ---- Step 5: Decoder layers ----
+        for decoder_layer in self.decoder_layers:
             queries = decoder_layer(
                 queries=queries,
-                compact_memory=encoded_memory,
                 track_memory=track_memory,
-                self_attention_mask=denoising_attention_mask,
                 track_padding_mask=track_padding_mask,
-            )  # (B, total_queries, decoder_dim)
-
-            # Stochastic depth: apply DropPath to the layer's residual delta.
-            # layer_delta = queries_after - queries_before captures the layer's
-            # contribution. DropPath randomly zeros this delta during training
-            # (with per-sample Bernoulli mask), effectively skipping the layer.
-            # The surviving deltas are scaled by 1/(1-p) to preserve expected
-            # values. During eval, all deltas pass through unchanged.
-            layer_delta = queries - previous_queries
-            queries = previous_queries + self.drop_paths[layer_index](layer_delta)
-
-            # Compute mask logits via dot-product scoring
-            # query_scores: (B, total_queries, mask_dim)
-            query_scores = self.query_scoring_mlp(queries)
-
-            # mask_logits = (query_scores @ track_keys^T) / tau
-            # score(query, key) = (query . key) / tau
-            # (B, total_queries, mask_dim) @ (B, mask_dim, P) -> (B, total_queries, P)
-            mask_logits = torch.bmm(
-                query_scores, track_keys.transpose(1, 2),
-            ) / clamped_temperature  # (B, total_queries, P)
-
-            # Mask out padded track positions with -inf
-            # softmax(-inf) -> 0 probability for padded positions
-            mask_logits = mask_logits.masked_fill(
-                pointer_padding_mask, float('-inf'),
             )
 
-            # Compute mask-informed confidence logits
-            # Step 1: soft attention readout of track features using mask probs.
-            # pointed_context = softmax(mask_logits) @ track_memory
-            # This encodes the enriched features of the track(s) each query
-            # is pointing at, giving the confidence head direct information
-            # about the quality and identity of the selected track.
-            #
-            # detach mask_logits so confidence loss does NOT backpropagate
-            # through the mask scoring path (query_scoring_mlp, track_key_mlp,
-            # temperature). The confidence loss still flows through queries
-            # and track_memory via the pointed_context computation.
-            mask_probabilities = torch.softmax(
-                mask_logits.detach(), dim=-1,
-            )  # (B, total_queries, P): padded positions get 0 from softmax(-inf)
-            pointed_context = torch.bmm(
-                mask_probabilities, track_memory,
-            )  # (B, total_queries, decoder_dim)
+        # ---- Step 6: Mask logits via dot-product scoring ----
+        # mask_logits = (query_scores @ track_keys^T) / τ
+        clamped_temperature = self.temperature.clamp(min=0.1, max=2.0)
+        query_scores = self.query_scoring_mlp(queries)
+        mask_logits = torch.bmm(
+            query_scores, track_keys.transpose(1, 2),
+        ) / clamped_temperature
 
-            # Step 2: concatenate decoded query + pointed context
-            # confidence_input = [query_representation, what_it_points_at]
-            confidence_input = torch.cat(
-                [queries, pointed_context], dim=-1,
-            )  # (B, total_queries, 2 * decoder_dim)
+        # Padded positions → -inf so softmax gives 0 probability
+        mask_logits = mask_logits.masked_fill(pointer_padding_mask, float('-inf'))
 
-            # Step 3: confidence_head: Linear(2*decoder_dim -> 128) -> GELU -> Linear(128 -> 1)
-            confidence_logits = self.confidence_head(
-                confidence_input,
-            ).squeeze(-1)  # (B, total_queries)
+        # ---- Step 7: Confidence logits ----
+        confidence_logits = self.confidence_head(queries).squeeze(-1)
 
-            all_layer_mask_logits.append(mask_logits)
-            all_layer_confidence_logits.append(confidence_logits)
-
-        return all_layer_mask_logits, all_layer_confidence_logits
+        return mask_logits, confidence_logits
