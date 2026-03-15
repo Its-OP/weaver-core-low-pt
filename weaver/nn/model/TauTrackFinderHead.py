@@ -34,6 +34,66 @@ import torch.nn as nn
 from weaver.nn.model.HierarchicalGraphBackbone import farthest_point_sampling
 
 
+class DropPath(nn.Module):
+    """Stochastic depth: randomly skip a layer's contribution during training.
+
+    Implements the residual-scaling variant of stochastic depth from
+    Huang et al., "Deep Networks with Stochastic Depth", ECCV 2016.
+
+    During training, the layer's residual delta (output - input) is either
+    passed through with probability (1 - drop_probability) and scaled by
+    1 / (1 - drop_probability) to preserve expected values, or zeroed out
+    with probability drop_probability (effectively skipping the layer).
+
+    The scaling ensures that:
+        E[DropPath(delta)] = delta
+    so the expected output is the same at train and eval time.
+
+    During evaluation, the delta is always passed through unchanged
+    (no dropout, no scaling).
+
+    Args:
+        drop_probability: Probability of dropping this layer's contribution.
+            Must be in [0, 1). Default: 0.0 (no dropout).
+    """
+
+    def __init__(self, drop_probability: float = 0.0):
+        super().__init__()
+        self.drop_probability = drop_probability
+
+    def forward(self, layer_delta: torch.Tensor) -> torch.Tensor:
+        """Apply stochastic depth to the layer's residual delta.
+
+        Args:
+            layer_delta: (B, num_queries, decoder_dim) difference between
+                decoder layer output and its input (the layer's contribution).
+
+        Returns:
+            Scaled or zeroed delta with same shape as input.
+        """
+        if not self.training or self.drop_probability == 0.0:
+            return layer_delta
+
+        keep_probability = 1.0 - self.drop_probability
+        # Binary mask: shape (batch_size, 1, 1) broadcasts across
+        # sequence length and feature dimensions.
+        # Each sample in the batch independently decides to keep or drop.
+        random_mask = torch.rand(
+            layer_delta.shape[0], 1, 1,
+            device=layer_delta.device,
+            dtype=layer_delta.dtype,
+        )
+        # Bernoulli mask: 1 if rand < keep_prob, else 0
+        random_mask = (random_mask < keep_probability).float()
+
+        # Scale surviving outputs by 1/keep_probability so that:
+        #   E[output] = keep_prob * (delta / keep_prob) + drop_prob * 0 = delta
+        return layer_delta * random_mask / keep_probability
+
+    def extra_repr(self) -> str:
+        return f'drop_probability={self.drop_probability:.3f}'
+
+
 class DualCrossAttentionDecoderLayer(nn.Module):
     """Decoder layer with dual cross-attention to compact tokens and tracks.
 
@@ -210,6 +270,13 @@ class TauTrackFinderHead(nn.Module):
             (default: 4). Reduced from 6 -- auxiliary losses at every layer
             compensate for fewer layers.
         dropout: Dropout rate in attention and feedforward layers (default: 0.1).
+        drop_path_rate: Maximum stochastic depth drop probability for the
+            last decoder layer (default: 0.0, disabled). Drop probabilities
+            increase linearly from 0 for the first decoder layer to
+            drop_path_rate for the last. Regularizes deep decoders by
+            randomly skipping layer contributions during training.
+            Reference: Huang et al., "Deep Networks with Stochastic Depth",
+            ECCV 2016.
     """
 
     def __init__(
@@ -222,6 +289,7 @@ class TauTrackFinderHead(nn.Module):
         num_encoder_layers: int = 6,
         num_decoder_layers: int = 4,
         dropout: float = 0.1,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         self.backbone_dim = backbone_dim
@@ -280,6 +348,23 @@ class TauTrackFinderHead(nn.Module):
             for _ in range(num_decoder_layers)
         ])
 
+        # ---- Stochastic Depth (DropPath) per decoder layer ----
+        # Drop probability increases linearly from 0 (first layer) to
+        # drop_path_rate (last layer):
+        #   p_i = drop_path_rate * i / (num_decoder_layers - 1)
+        # for i = 0, 1, ..., num_decoder_layers - 1.
+        # When num_decoder_layers == 1, the single layer gets rate 0.
+        # Applied to the layer's residual delta: queries_out - queries_in.
+        # Reference: Huang et al., "Deep Networks with Stochastic Depth", ECCV 2016.
+        per_layer_drop_rates = [
+            drop_path_rate * layer_index / max(num_decoder_layers - 1, 1)
+            for layer_index in range(num_decoder_layers)
+        ]
+        self.drop_paths = nn.ModuleList([
+            DropPath(drop_probability=rate)
+            for rate in per_layer_drop_rates
+        ])
+
         # ---- Track Key MLP ----
         # Projects enriched per-track features (B, backbone_dim, P) to mask
         # scoring key space (B, mask_dim, P) for dot-product scoring with
@@ -310,7 +395,8 @@ class TauTrackFinderHead(nn.Module):
         # Learnable tau lets the model tune the trade-off between:
         #   - Too flat (tau large): can't commit to a specific track
         #   - Too sharp (tau small): gradients vanish for non-selected tracks
-        # Clamped to min=0.01 to prevent division by near-zero.
+        # Clamped to [0.1, 2.0]: min=0.1 prevents too-sharp distributions,
+        # max=2.0 prevents too-flat distributions that can't select tracks.
         self.temperature = nn.Parameter(torch.ones(1))
 
         # ---- Confidence Head ----
@@ -468,8 +554,12 @@ class TauTrackFinderHead(nn.Module):
         pointer_padding_mask = ~mask.bool()  # (B, 1, P): True = padded
 
         # Clamp temperature once (shared across all layers)
-        # tau clamped to min=0.01 to prevent division by near-zero
-        clamped_temperature = self.temperature.clamp(min=0.01)
+        # tau clamped to [0.1, 2.0]:
+        #   min=0.1 prevents too-sharp distributions where logits explode
+        #     and cross-entropy gradients spike when the matching changes
+        #   max=2.0 prevents too-flat distributions that can't commit
+        #     to selecting specific tracks over ~1130 candidates
+        clamped_temperature = self.temperature.clamp(min=0.1, max=2.0)
 
         # ------------------------------------------------------------------
         # Step 8: Run through decoder layers with auxiliary outputs
@@ -478,7 +568,10 @@ class TauTrackFinderHead(nn.Module):
         all_layer_confidence_logits = []
 
         queries = all_queries
-        for decoder_layer in self.decoder_layers:
+        for layer_index, decoder_layer in enumerate(self.decoder_layers):
+            # Save queries before this layer for stochastic depth residual
+            previous_queries = queries
+
             # Forward through DualCrossAttentionDecoderLayer
             queries = decoder_layer(
                 queries=queries,
@@ -487,6 +580,15 @@ class TauTrackFinderHead(nn.Module):
                 self_attention_mask=denoising_attention_mask,
                 track_padding_mask=track_padding_mask,
             )  # (B, total_queries, decoder_dim)
+
+            # Stochastic depth: apply DropPath to the layer's residual delta.
+            # layer_delta = queries_after - queries_before captures the layer's
+            # contribution. DropPath randomly zeros this delta during training
+            # (with per-sample Bernoulli mask), effectively skipping the layer.
+            # The surviving deltas are scaled by 1/(1-p) to preserve expected
+            # values. During eval, all deltas pass through unchanged.
+            layer_delta = queries - previous_queries
+            queries = previous_queries + self.drop_paths[layer_index](layer_delta)
 
             # Compute mask logits via dot-product scoring
             # query_scores: (B, total_queries, mask_dim)

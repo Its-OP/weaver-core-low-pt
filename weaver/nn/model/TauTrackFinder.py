@@ -84,6 +84,15 @@ class TauTrackFinder(nn.Module):
             (default: 5). Each group contains max_gt_tracks noised queries.
         denoising_noise_scale: Standard deviation of Gaussian noise added to
             GT track features for denoising queries (default: 0.5).
+        label_smoothing: Label smoothing factor for cross-entropy mask loss
+            (default: 0.1). Distributes (1 - label_smoothing) probability to
+            the correct class and label_smoothing / num_classes uniformly to
+            all classes. Prevents overconfident logit growth that causes
+            training instability when LR increases after warmup:
+                CE_smooth = (1 - ε) * CE(p, y) + ε * H(u, p)
+            where ε = label_smoothing, u = uniform distribution, and H is
+            the cross-entropy. Equivalent to:
+                F.cross_entropy(logits, target, label_smoothing=ε)
     """
 
     def __init__(
@@ -96,6 +105,7 @@ class TauTrackFinder(nn.Module):
         no_object_weight: float = 0.4,
         num_denoising_groups: int = 5,
         denoising_noise_scale: float = 0.5,
+        label_smoothing: float = 0.1,
     ):
         super().__init__()
 
@@ -110,6 +120,7 @@ class TauTrackFinder(nn.Module):
         self.no_object_weight = no_object_weight
         self.num_denoising_groups = num_denoising_groups
         self.denoising_noise_scale = denoising_noise_scale
+        self.label_smoothing = label_smoothing
 
         # Maximum number of GT tracks per event
         self.max_gt_tracks = decoder_kwargs.pop('max_gt_tracks', 6)
@@ -495,11 +506,23 @@ class TauTrackFinder(nn.Module):
             # Gather matched query logits: (num_matched, P)
             matched_logits = mask_logits[valid_batch_indices, valid_query_indices]  # (M, P)
 
-            # Cross-entropy: softmax over P tracks, NLL at GT track position
+            # Replace -inf with a large negative finite value for label smoothing
+            # compatibility. Label smoothing computes:
+            #   CE_smooth = (1 - ε) * CE(p, y) + ε * H(u, p)
+            # where H(u, p) = -mean(log_softmax). With -inf logits,
+            # log_softmax = -inf, so -log_softmax = +inf, making the loss
+            # infinite. Using -1e9 instead gives softmax ≈ 0 (effectively
+            # masked) while keeping the smoothing term finite.
+            matched_logits = matched_logits.clamp(min=-1e9)
+
+            # Cross-entropy with label smoothing: softmax over P tracks,
+            # NLL at GT track position. Label smoothing prevents extreme logit
+            # growth by distributing ε probability mass uniformly:
+            #   CE_smooth = (1 - ε) * CE(p, y) + ε * H(u, p)
             # F.cross_entropy handles log_softmax + NLL in a numerically stable way.
-            # Padded tracks (logits = -inf) get softmax = 0 automatically.
             mask_ce_loss = functional.cross_entropy(
                 matched_logits, valid_gt_tracks.long(),
+                label_smoothing=self.label_smoothing,
             )
 
         # Step 3: Confidence BCE — vectorized
@@ -565,10 +588,17 @@ class TauTrackFinder(nn.Module):
             # Each target has exactly 1 positive track → argmax gives the index
             gt_track_indices = valid_targets.argmax(dim=1)  # (V,)
 
-            # Cross-entropy: softmax over P tracks, NLL at GT track position
-            # Padded tracks (logits = -inf) get softmax = 0 automatically.
+            # Replace -inf with a large negative finite value for label smoothing
+            # compatibility (see _compute_losses_single_layer for explanation).
+            valid_logits = valid_logits.clamp(min=-1e9)
+
+            # Cross-entropy with label smoothing: softmax over P tracks,
+            # NLL at GT track position. Uses the same label_smoothing as
+            # the learnable query loss for consistent gradient scaling:
+            #   CE_smooth = (1 - ε) * CE(p, y) + ε * H(u, p)
             denoising_mask_ce_loss = functional.cross_entropy(
                 valid_logits, gt_track_indices,
+                label_smoothing=self.label_smoothing,
             )
         else:
             denoising_mask_ce_loss = torch.tensor(0.0, device=device)
