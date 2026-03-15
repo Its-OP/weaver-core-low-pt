@@ -48,8 +48,12 @@ class TauTrackFinder(nn.Module):
         backbone_kwargs: Keyword arguments for EnrichCompactBackbone.
         decoder_kwargs: Keyword arguments for TauTrackFinderHead.
             Must include 'max_gt_tracks' (default: 6).
-        pointer_loss_weight: Weight for pointer focal loss (default: 5.0).
-        confidence_loss_weight: Weight for confidence BCE loss (default: 1.0).
+        pointer_loss_weight: Weight for pointer focal loss (default: 2.0).
+            Reduced from 5.0 — at the old 5:1 ratio, pointer loss dominated
+            the total loss (~95% at epoch 12), drowning confidence gradients.
+        confidence_loss_weight: Weight for confidence BCE loss (default: 5.0).
+            Increased from 1.0 — the 2:5 ratio ensures the model receives
+            meaningful gradient signal for learning confidence predictions.
         focal_alpha: Alpha parameter for focal loss (default: 0.25).
         focal_gamma: Gamma parameter for focal loss (default: 2.0).
     """
@@ -58,8 +62,8 @@ class TauTrackFinder(nn.Module):
         self,
         backbone_kwargs: dict | None = None,
         decoder_kwargs: dict | None = None,
-        pointer_loss_weight: float = 5.0,
-        confidence_loss_weight: float = 1.0,
+        pointer_loss_weight: float = 2.0,
+        confidence_loss_weight: float = 5.0,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
     ):
