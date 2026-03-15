@@ -516,16 +516,12 @@ class TauTrackFinder(nn.Module):
         ground_truth_indices: torch.Tensor,
         ground_truth_count: torch.Tensor,
         mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Compute dice + focal BCE + confidence losses for one decoder layer's output.
+        precomputed_match: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Compute dice + focal BCE + confidence losses for one decoder layer.
 
-        Steps:
-            1. Build cost matrix, run Hungarian matching (bipartite assignment)
-            2. For each matched query-GT pair:
-               - Build GT binary mask (1 at GT track index, 0 elsewhere)
-               - Compute dice_loss(query_mask_logits, gt_mask)
-               - Compute focal_bce_loss(query_mask_logits, gt_mask)
-            3. Confidence BCE with no_object_weight for unmatched queries
+        Accepts optional pre-computed Hungarian matching to avoid redundant
+        CPU round-trips when computing auxiliary losses across decoder layers.
 
         Args:
             mask_logits: (B, num_queries, P) mask prediction logits.
@@ -533,97 +529,109 @@ class TauTrackFinder(nn.Module):
             ground_truth_indices: (B, max_gt_tracks) GT track indices (-1 = invalid).
             ground_truth_count: (B,) number of valid GT tracks per event.
             mask: (B, 1, P) boolean mask, True for valid tracks.
+            precomputed_match: Optional tuple of (matched_query_indices,
+                matched_gt_track_indices, match_is_valid) to skip Hungarian.
 
         Returns:
-            Dict with 'mask_dice_loss', 'mask_focal_bce_loss', 'confidence_loss'.
+            Tuple of (loss_dict, match_tuple):
+                loss_dict: 'mask_dice_loss', 'mask_focal_bce_loss', 'confidence_loss'
+                match_tuple: (matched_query_indices, matched_gt_track_indices,
+                    match_is_valid) for reuse by other layers.
         """
         batch_size = mask_logits.shape[0]
         num_queries = mask_logits.shape[1]
         num_tracks = mask_logits.shape[2]
         device = mask_logits.device
 
-        # Step 1: Build cost matrix and run Hungarian matching
-        cost_matrix = self._compute_cost_matrix(
-            mask_logits, confidence_logits, ground_truth_indices, ground_truth_count,
-        )  # (B, num_queries, max_gt_tracks)
+        # Step 1: Hungarian matching (or reuse pre-computed)
+        if precomputed_match is not None:
+            matched_query_indices, matched_gt_track_indices, match_is_valid = precomputed_match
+        else:
+            cost_matrix = self._compute_cost_matrix(
+                mask_logits, confidence_logits,
+                ground_truth_indices, ground_truth_count,
+            )
+            match_indices = hungarian_matcher(cost_matrix.detach())
+            matched_query_indices = match_indices[:, 0, :]  # (B, max_gt)
+            matched_gt_slot_indices = match_indices[:, 1, :]
+            matched_gt_track_indices = ground_truth_indices.gather(
+                1, matched_gt_slot_indices,
+            )
+            match_is_valid = matched_gt_track_indices != -1
 
-        # hungarian_matcher: (B, num_queries, max_gt) -> (B, 2, max_gt)
-        # indices[:, 0] = matched query indices
-        # indices[:, 1] = matched GT slot indices
-        match_indices = hungarian_matcher(cost_matrix.detach())
-        matched_query_indices = match_indices[:, 0, :]   # (B, max_gt)
-        matched_gt_slot_indices = match_indices[:, 1, :]  # (B, max_gt)
+        match_tuple = (matched_query_indices, matched_gt_track_indices, match_is_valid)
 
-        # Identify which matched pairs are real (not empty GT slots)
-        matched_gt_track_indices = ground_truth_indices.gather(
-            1, matched_gt_slot_indices,
-        )  # (B, max_gt): actual track index for each match
-        match_is_valid = matched_gt_track_indices != -1  # (B, max_gt)
+        # Step 2: Vectorized mask losses (dice + focal BCE)
+        # Gather matched query logits: for each valid match, get the query's
+        # mask logits and build the GT binary mask.
+        # valid_track_mask: (B, P) — True for non-padded tracks
+        valid_track_mask = mask.squeeze(1).bool()  # (B, P)
 
-        # Step 2: Mask losses (dice + focal BCE) — only on validly matched queries
         total_dice_loss = torch.tensor(0.0, device=device)
         total_focal_bce_loss = torch.tensor(0.0, device=device)
-        num_matched_total = 0
+        num_matched_total = match_is_valid.sum().item()
 
-        for batch_index in range(batch_size):
-            for match_slot in range(self.max_gt_tracks):
-                if not match_is_valid[batch_index, match_slot]:
-                    continue
-
-                query_index = matched_query_indices[batch_index, match_slot]
-                target_track_index = matched_gt_track_indices[batch_index, match_slot]
-
-                # Build GT binary mask: 1 at GT track position, 0 elsewhere
-                gt_binary_mask = torch.zeros(
-                    num_tracks, device=device, dtype=mask_logits.dtype,
-                )
-                gt_binary_mask[target_track_index] = 1.0
-
-                # Get this query's mask logits
-                query_mask_logits = mask_logits[batch_index, query_index]  # (P,)
-
-                # Compute dice loss for this query-GT pair
-                total_dice_loss = total_dice_loss + self._dice_loss(
-                    query_mask_logits, gt_binary_mask,
-                )
-
-                # Compute focal BCE loss for this query-GT pair.
-                # Only include valid (non-padded) tracks to avoid NaN from
-                # BCE(-inf, 0) which produces NaN on MPS/some backends.
-                valid_track_mask = mask[batch_index].squeeze(0).bool()  # (P,)
-                total_focal_bce_loss = total_focal_bce_loss + self._focal_bce_loss(
-                    query_mask_logits[valid_track_mask],
-                    gt_binary_mask[valid_track_mask],
-                )
-
-                num_matched_total += 1
-
-        # Average over matched pairs (avoid division by zero)
         if num_matched_total > 0:
-            mask_dice_loss = total_dice_loss / num_matched_total
-            mask_focal_bce_loss = total_focal_bce_loss / num_matched_total
-        else:
-            mask_dice_loss = torch.tensor(0.0, device=device)
-            mask_focal_bce_loss = torch.tensor(0.0, device=device)
+            # Flatten valid matches across batch: collect (batch_idx, query_idx, gt_track_idx)
+            valid_batch_indices, valid_slot_indices = match_is_valid.nonzero(as_tuple=True)
+            valid_query_indices = matched_query_indices[valid_batch_indices, valid_slot_indices]
+            valid_gt_tracks = matched_gt_track_indices[valid_batch_indices, valid_slot_indices]
 
-        # Step 3: Confidence BCE loss — all queries
-        # Build confidence targets: 1 for queries matched to real GT, 0 otherwise
-        confidence_targets = torch.zeros(
-            batch_size, num_queries, device=device,
-        )
-        for batch_index in range(batch_size):
-            for match_slot in range(self.max_gt_tracks):
-                if match_is_valid[batch_index, match_slot]:
-                    query_index = matched_query_indices[batch_index, match_slot]
-                    confidence_targets[batch_index, query_index] = 1.0
+            # Gather matched query logits: (num_matched, P)
+            matched_logits = mask_logits[valid_batch_indices, valid_query_indices]  # (M, P)
 
-        # No-object coefficient (Carion et al., DETR, ECCV 2020):
-        # Downweight the "empty" class in confidence BCE to prevent the model
-        # from trivially minimizing loss by always predicting "no object".
-        #
-        # Weight scheme:
-        #   - Matched queries (exists):  weight = 1.0
-        #   - Unmatched queries (empty): weight = no_object_weight
+            # Build GT binary masks: (num_matched, P) with 1 at gt_track position
+            gt_masks = torch.zeros(
+                num_matched_total, num_tracks, device=device, dtype=mask_logits.dtype,
+            )
+            gt_masks.scatter_(1, valid_gt_tracks.unsqueeze(1).long(), 1.0)
+
+            # Dice loss — vectorized over all matched pairs
+            # dice = 1 - (2 * sum(p * g) + eps) / (sum(p) + sum(g) + eps)
+            epsilon = 1e-6
+            matched_probs = torch.sigmoid(matched_logits)  # (M, P)
+            intersection = (matched_probs * gt_masks).sum(dim=1)  # (M,)
+            denominator = matched_probs.sum(dim=1) + gt_masks.sum(dim=1)  # (M,)
+            dice_per_match = 1.0 - (2.0 * intersection + epsilon) / (denominator + epsilon)
+            total_dice_loss = dice_per_match.mean()
+
+            # Focal BCE — exclude padded tracks (BCE(-inf, 0) = NaN on MPS).
+            # Zero out padded positions BEFORE computing BCE.
+            matched_valid_masks = valid_track_mask[valid_batch_indices]  # (M, P)
+
+            safe_logits = matched_logits.clone()
+            safe_logits[~matched_valid_masks] = 0.0
+            safe_gt_masks = gt_masks.clone()
+            safe_gt_masks[~matched_valid_masks] = 0.0
+            safe_probs = torch.sigmoid(safe_logits)
+
+            bce_per_track = functional.binary_cross_entropy_with_logits(
+                safe_logits, safe_gt_masks, reduction='none',
+            )  # (M, P)
+
+            # Focal modulation: alpha_t * (1 - p_t)^gamma
+            probability_correct = torch.where(
+                safe_gt_masks == 1.0, safe_probs, 1.0 - safe_probs,
+            )
+            alpha_weight = torch.where(
+                safe_gt_masks == 1.0, self.focal_alpha, 1.0 - self.focal_alpha,
+            )
+            focal_weight = alpha_weight * ((1.0 - probability_correct) ** self.focal_gamma)
+            focal_bce_per_track = focal_weight * bce_per_track  # (M, P)
+
+            # Mask out padded tracks and average
+            focal_bce_per_track = focal_bce_per_track * matched_valid_masks.float()
+            num_valid_per_match = matched_valid_masks.float().sum(dim=1).clamp(min=1)
+            focal_bce_per_match = focal_bce_per_track.sum(dim=1) / num_valid_per_match
+            total_focal_bce_loss = focal_bce_per_match.mean()
+
+        # Step 3: Confidence BCE — vectorized
+        confidence_targets = torch.zeros(batch_size, num_queries, device=device)
+        if num_matched_total > 0:
+            valid_batch_indices_conf, valid_slot_indices_conf = match_is_valid.nonzero(as_tuple=True)
+            valid_query_indices_conf = matched_query_indices[valid_batch_indices_conf, valid_slot_indices_conf]
+            confidence_targets[valid_batch_indices_conf, valid_query_indices_conf] = 1.0
+
         confidence_weights = torch.where(
             confidence_targets == 1.0,
             torch.ones_like(confidence_targets),
@@ -633,11 +641,12 @@ class TauTrackFinder(nn.Module):
             confidence_logits, confidence_targets, weight=confidence_weights,
         )
 
-        return {
-            'mask_dice_loss': mask_dice_loss,
-            'mask_focal_bce_loss': mask_focal_bce_loss,
+        loss_dict = {
+            'mask_dice_loss': total_dice_loss,
+            'mask_focal_bce_loss': total_focal_bce_loss,
             'confidence_loss': confidence_loss,
         }
+        return loss_dict, match_tuple
 
     def _compute_denoising_losses(
         self,
@@ -669,47 +678,52 @@ class TauTrackFinder(nn.Module):
             Dict with 'denoising_dice_loss', 'denoising_focal_bce_loss',
             'denoising_confidence_loss'.
         """
-        batch_size = denoising_mask_logits.shape[0]
-        num_denoising_queries = denoising_mask_logits.shape[1]
         device = denoising_mask_logits.device
+        num_valid_total = denoising_valid_mask.sum().item()
 
-        # Mask losses: only for valid denoising queries
-        total_dice_loss = torch.tensor(0.0, device=device)
-        total_focal_bce_loss = torch.tensor(0.0, device=device)
-        num_valid_total = 0
-
-        for batch_index in range(batch_size):
-            for query_index in range(num_denoising_queries):
-                if not denoising_valid_mask[batch_index, query_index]:
-                    continue
-
-                query_mask_logits = denoising_mask_logits[
-                    batch_index, query_index
-                ]  # (P,)
-                query_mask_targets = denoising_mask_targets[
-                    batch_index, query_index
-                ]  # (P,)
-
-                total_dice_loss = total_dice_loss + self._dice_loss(
-                    query_mask_logits, query_mask_targets,
-                )
-                # Exclude padded tracks to avoid NaN from BCE(-inf, 0)
-                if track_mask is not None:
-                    valid_tracks = track_mask[batch_index].squeeze(0).bool()
-                    total_focal_bce_loss = total_focal_bce_loss + self._focal_bce_loss(
-                        query_mask_logits[valid_tracks],
-                        query_mask_targets[valid_tracks],
-                    )
-                else:
-                    total_focal_bce_loss = total_focal_bce_loss + self._focal_bce_loss(
-                        query_mask_logits, query_mask_targets,
-                    )
-                num_valid_total += 1
-
-        # Average over valid denoising queries
         if num_valid_total > 0:
-            denoising_dice_loss = total_dice_loss / num_valid_total
-            denoising_focal_bce_loss = total_focal_bce_loss / num_valid_total
+            # Flatten valid denoising queries: (num_valid, P)
+            valid_batch_indices, valid_query_indices = denoising_valid_mask.nonzero(as_tuple=True)
+            valid_logits = denoising_mask_logits[valid_batch_indices, valid_query_indices]  # (V, P)
+            valid_targets = denoising_mask_targets[valid_batch_indices, valid_query_indices]  # (V, P)
+
+            # Vectorized dice loss
+            epsilon = 1e-6
+            valid_probs = torch.sigmoid(valid_logits)
+            intersection = (valid_probs * valid_targets).sum(dim=1)
+            denominator = valid_probs.sum(dim=1) + valid_targets.sum(dim=1)
+            dice_per_query = 1.0 - (2.0 * intersection + epsilon) / (denominator + epsilon)
+            denoising_dice_loss = dice_per_query.mean()
+
+            # Vectorized focal BCE (exclude padded tracks)
+            # Replace -inf logits at padded positions with 0 BEFORE BCE
+            # to avoid NaN from BCE(-inf, 0) on MPS.
+            if track_mask is not None:
+                valid_track_masks = track_mask.squeeze(1).bool()[valid_batch_indices]  # (V, P)
+            else:
+                valid_track_masks = torch.ones_like(valid_logits, dtype=torch.bool)
+
+            # Zero out padded positions in logits to prevent NaN in BCE
+            safe_logits = valid_logits.clone()
+            safe_logits[~valid_track_masks] = 0.0
+            safe_targets = valid_targets.clone()
+            safe_targets[~valid_track_masks] = 0.0
+
+            bce_per_track = functional.binary_cross_entropy_with_logits(
+                safe_logits, safe_targets, reduction='none',
+            )
+            safe_probs = torch.sigmoid(safe_logits)
+            probability_correct = torch.where(
+                safe_targets == 1.0, safe_probs, 1.0 - safe_probs,
+            )
+            alpha_weight = torch.where(
+                safe_targets == 1.0, self.focal_alpha, 1.0 - self.focal_alpha,
+            )
+            focal_weight = alpha_weight * ((1.0 - probability_correct) ** self.focal_gamma)
+            focal_bce_per_track = focal_weight * bce_per_track * valid_track_masks.float()
+            num_valid_per_query = valid_track_masks.float().sum(dim=1).clamp(min=1)
+            focal_bce_per_query = focal_bce_per_track.sum(dim=1) / num_valid_per_query
+            denoising_focal_bce_loss = focal_bce_per_query.mean()
         else:
             denoising_dice_loss = torch.tensor(0.0, device=device)
             denoising_focal_bce_loss = torch.tensor(0.0, device=device)
@@ -837,21 +851,31 @@ class TauTrackFinder(nn.Module):
             accumulated_focal_bce_loss = torch.tensor(0.0, device=enriched_features.device)
             accumulated_confidence_loss = torch.tensor(0.0, device=enriched_features.device)
 
+            # Run Hungarian matching ONCE on the last layer's output,
+            # then reuse the assignment for all layers' auxiliary losses.
+            # This avoids num_layers CPU round-trips to scipy.
+            last_learnable_mask = all_layer_mask_logits[-1][:, :num_learnable, :]
+            last_learnable_conf = all_layer_confidence_logits[-1][:, :num_learnable]
+            _, cached_match = self._compute_losses_single_layer(
+                last_learnable_mask, last_learnable_conf,
+                ground_truth_indices, ground_truth_count, mask,
+            )
+
             for layer_index in range(num_layers):
                 layer_mask_logits = all_layer_mask_logits[layer_index]
                 layer_confidence_logits = all_layer_confidence_logits[layer_index]
 
-                # Split learnable and denoising outputs
                 learnable_mask_logits = layer_mask_logits[:, :num_learnable, :]
                 learnable_confidence_logits = layer_confidence_logits[:, :num_learnable]
 
-                # Compute losses for learnable queries (with Hungarian matching)
-                layer_losses = self._compute_losses_single_layer(
+                # Reuse cached Hungarian assignment for all layers
+                layer_losses, _ = self._compute_losses_single_layer(
                     learnable_mask_logits,
                     learnable_confidence_logits,
                     ground_truth_indices,
                     ground_truth_count,
                     mask,
+                    precomputed_match=cached_match,
                 )
 
                 accumulated_dice_loss = accumulated_dice_loss + layer_losses['mask_dice_loss']
