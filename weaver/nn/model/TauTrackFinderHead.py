@@ -9,6 +9,11 @@ Architecture follows the original DETR (Carion et al., ECCV 2020):
        enriched features, with a learned temperature parameter.
     4. Confidence Head: per-query binary prediction (exists / empty).
 
+Supports returning intermediate decoder layer outputs for auxiliary loss
+computation (DETR pattern, Carion et al., Section 3.2). When enabled, the
+forward pass manually iterates over decoder layers and collects outputs
+from each, allowing the loss function to supervise every decoder depth.
+
 The backbone is external — this module only receives backbone outputs
 (enriched features and compact tokens) and produces pointer logits and
 confidence logits. Loss computation is handled by TauTrackFinder.
@@ -28,6 +33,12 @@ class TauTrackFinderHead(nn.Module):
     the backbone, processes them through a transformer encoder-decoder,
     and produces pointer logits (which track each query selects) and
     confidence logits (whether each query represents a real track).
+
+    Supports returning intermediate decoder layer outputs for auxiliary
+    loss computation (DETR pattern). When ``return_intermediate=True``,
+    the forward pass manually iterates over decoder layers, collecting
+    pointer and confidence outputs at each depth. The prediction heads
+    (query_scoring_mlp, confidence_head) are shared across all layers.
 
     Args:
         backbone_dim: Channel dimension of backbone outputs (default: 256).
@@ -162,7 +173,11 @@ class TauTrackFinderHead(nn.Module):
         enriched_features: torch.Tensor,
         compact_tokens: torch.Tensor,
         mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_intermediate: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
+    ):
         """Forward pass: encode compact tokens, decode queries, score tracks.
 
         Args:
@@ -171,13 +186,26 @@ class TauTrackFinderHead(nn.Module):
             compact_tokens: (B, backbone_dim, 128) compact spatial tokens from
                 backbone.compact(). Used as encoder input / decoder memory.
             mask: (B, 1, P) boolean mask, True for valid tracks.
+            return_intermediate: If True, return pointer and confidence logits
+                from all non-final decoder layers for auxiliary loss computation
+                (DETR pattern, Carion et al., Section 3.2).
 
         Returns:
-            Tuple of:
-                pointer_logits: (B, num_queries, P) scores for each query
-                    over all tracks. Padded positions are -inf.
-                confidence_logits: (B, num_queries) per-query exists/empty
-                    logits (pre-sigmoid).
+            If return_intermediate is False (default):
+                Tuple of:
+                    pointer_logits: (B, num_queries, P) scores for each query
+                        over all tracks. Padded positions are -inf.
+                    confidence_logits: (B, num_queries) per-query exists/empty
+                        logits (pre-sigmoid).
+
+            If return_intermediate is True:
+                Tuple of:
+                    pointer_logits: (B, num_queries, P) from the final decoder layer.
+                    confidence_logits: (B, num_queries) from the final decoder layer.
+                    intermediate_pointer_logits: list of (B, num_queries, P) from
+                        each non-final decoder layer.
+                    intermediate_confidence_logits: list of (B, num_queries) from
+                        each non-final decoder layer.
         """
         batch_size = enriched_features.shape[0]
         device = enriched_features.device
@@ -203,10 +231,19 @@ class TauTrackFinderHead(nn.Module):
             batch_size, -1, -1,
         )  # (B, num_queries, decoder_dim)
 
-        # Decoder: self-attention among queries + cross-attention to encoded memory
-        decoded_queries = self.transformer_decoder(
-            tgt=queries, memory=encoded_memory,
-        )  # (B, num_queries, decoder_dim)
+        # Decode queries through decoder layers, optionally collecting
+        # intermediate outputs for auxiliary loss computation (DETR pattern).
+        # Instead of using nn.TransformerDecoder as a black box, we manually
+        # iterate over its layers to capture per-layer decoded queries.
+        decoded_queries = queries
+        intermediate_outputs = []
+
+        for decoder_layer in self.transformer_decoder.layers:
+            decoded_queries = decoder_layer(
+                tgt=decoded_queries, memory=encoded_memory,
+            )
+            if return_intermediate:
+                intermediate_outputs.append(decoded_queries)
 
         # Step 4: Pointer scoring via dot-product with learned temperature
         # query_projections: (B, num_queries, pointer_dim)
@@ -230,4 +267,38 @@ class TauTrackFinderHead(nn.Module):
             decoded_queries,
         ).squeeze(-1)  # (B, num_queries)
 
-        return pointer_logits, confidence_logits
+        if not return_intermediate:
+            return pointer_logits, confidence_logits
+
+        # Step 6: Compute pointer and confidence logits from intermediate
+        # decoder layers (all layers except the final one, which is already
+        # returned as the main output). Uses shared prediction heads
+        # (query_scoring_mlp, confidence_head) across all layers.
+        intermediate_pointer_logits = []
+        intermediate_confidence_logits = []
+
+        for intermediate_decoded in intermediate_outputs[:-1]:
+            # score(q, k) = (q_proj · k) / τ  with shared projection heads
+            intermediate_query_projections = self.query_scoring_mlp(
+                intermediate_decoded,
+            )
+            intermediate_pointer = torch.bmm(
+                intermediate_query_projections, track_keys.transpose(1, 2),
+            ) / clamped_temperature  # (B, num_queries, P)
+            intermediate_pointer = intermediate_pointer.masked_fill(
+                padding_mask, float('-inf'),
+            )
+
+            intermediate_confidence = self.confidence_head(
+                intermediate_decoded,
+            ).squeeze(-1)  # (B, num_queries)
+
+            intermediate_pointer_logits.append(intermediate_pointer)
+            intermediate_confidence_logits.append(intermediate_confidence)
+
+        return (
+            pointer_logits,
+            confidence_logits,
+            intermediate_pointer_logits,
+            intermediate_confidence_logits,
+        )

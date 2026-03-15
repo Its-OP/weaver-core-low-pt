@@ -4,6 +4,7 @@ Top-level module combining:
     1. Pretrained EnrichCompactBackbone (frozen, no gradients)
     2. TauTrackFinderHead (encoder + decoder + pointer + confidence)
     3. Loss computation (Hungarian matching + focal pointer + confidence BCE)
+    4. Auxiliary losses from intermediate decoder layers (DETR pattern)
 
 The task: find up to 6 pion tracks originating from tau decay among ~1130
 tracks per event. Uses 15 learned queries (over-prediction) — excess queries
@@ -15,6 +16,13 @@ Loss components:
         FL(p_t) = -α (1 - p_t)^γ log(p_t), α=0.25, γ=2.0
     - Confidence BCE loss (Carion et al., ECCV 2020, DETR):
         Binary cross-entropy for exists/∅ on all 15 queries.
+    - Auxiliary losses (Carion et al., ECCV 2020, Section 3.2):
+        Pointer + confidence losses applied to ALL intermediate decoder layers,
+        not just the final one. Provides deeper supervision, helping gradients
+        flow through all decoder layers and significantly speeding convergence.
+        Each layer uses shared prediction heads and independent Hungarian
+        matching. Auxiliary losses are averaged across layers and weighted by
+        auxiliary_loss_weight.
     - Hungarian matching (Kuhn, 1955):
         Optimal 1-to-1 assignment of queries to GT tracks (no gradients).
         Reuses existing hungarian_matcher from weaver.
@@ -41,6 +49,7 @@ class TauTrackFinder(nn.Module):
         2. Backbone compaction (frozen): enriched → compact tokens (B, 256, 128)
         3. Head forward: pointer logits (B, 15, P) + confidence logits (B, 15)
         4. Loss: Hungarian matching → focal pointer + confidence BCE
+        5. Auxiliary losses from intermediate decoder layers (training only)
 
     Training mode returns loss dict. Eval mode returns logits dict.
 
@@ -52,6 +61,9 @@ class TauTrackFinder(nn.Module):
         confidence_loss_weight: Weight for confidence BCE loss (default: 1.0).
         focal_alpha: Alpha parameter for focal loss (default: 0.25).
         focal_gamma: Gamma parameter for focal loss (default: 2.0).
+        auxiliary_loss_weight: Weight for auxiliary losses from intermediate
+            decoder layers (default: 1.0). Controls the contribution of
+            intermediate-layer supervision relative to the final-layer losses.
     """
 
     def __init__(
@@ -62,6 +74,7 @@ class TauTrackFinder(nn.Module):
         confidence_loss_weight: float = 1.0,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
+        auxiliary_loss_weight: float = 1.0,
     ):
         super().__init__()
 
@@ -74,6 +87,7 @@ class TauTrackFinder(nn.Module):
         self.confidence_loss_weight = confidence_loss_weight
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
+        self.auxiliary_loss_weight = auxiliary_loss_weight
 
         # Maximum number of GT tracks per event
         self.max_gt_tracks = decoder_kwargs.pop('max_gt_tracks', 6)
@@ -333,6 +347,16 @@ class TauTrackFinder(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Forward pass: backbone → head → loss (training) or logits (inference).
 
+        During training, intermediate decoder layer outputs are collected and
+        auxiliary losses (pointer + confidence) are computed for each non-final
+        decoder layer. This follows the DETR pattern (Carion et al., Section
+        3.2) for deeper supervision. The auxiliary loss is:
+            L_aux = w_aux × mean_over_layers(
+                w_ptr × FL_layer + w_conf × BCE_layer
+            )
+        where w_aux = auxiliary_loss_weight, w_ptr = pointer_loss_weight,
+        w_conf = confidence_loss_weight.
+
         Args:
             points: (B, 2, P) coordinates in (η, φ).
             features: (B, input_dim, P) per-track features (standardized).
@@ -343,7 +367,7 @@ class TauTrackFinder(nn.Module):
 
         Returns:
             Training: dict with 'total_loss', 'pointer_focal_loss',
-                'confidence_bce_loss' (all scalar tensors).
+                'confidence_bce_loss', 'auxiliary_loss' (all scalar tensors).
             Inference: dict with 'pointer_logits' (B, num_queries, P) and
                 'confidence_logits' (B, num_queries).
         """
@@ -365,21 +389,89 @@ class TauTrackFinder(nn.Module):
 
         compact_tokens = compact_tokens.detach()
 
+        # Training: request intermediate decoder layer outputs for auxiliary losses
+        if track_labels is not None:
+            # Step 3: Head forward with intermediate outputs (trainable)
+            (
+                pointer_logits,
+                confidence_logits,
+                intermediate_pointer_list,
+                intermediate_confidence_list,
+            ) = self.head(
+                enriched_features, compact_tokens, mask,
+                return_intermediate=True,
+            )
+
+            gt_indices, gt_count = self._extract_ground_truth_indices(
+                track_labels, mask,
+            )
+
+            # Main losses from the final decoder layer
+            main_losses = self._compute_losses(
+                pointer_logits, confidence_logits, gt_indices, gt_count,
+            )
+            pointer_focal_loss = main_losses['pointer_focal_loss']
+            confidence_bce_loss = main_losses['confidence_bce_loss']
+
+            device = pointer_logits.device
+
+            # Auxiliary losses from intermediate decoder layers (DETR pattern,
+            # Carion et al., ECCV 2020, Section 3.2).
+            # Each intermediate layer gets its own prediction heads (shared weights)
+            # and the same Hungarian matching + loss computation as the final layer.
+            # This provides deeper supervision, helping gradients flow through all
+            # decoder layers and significantly speeding up convergence.
+            auxiliary_pointer_loss = torch.tensor(0.0, device=device)
+            auxiliary_confidence_loss = torch.tensor(0.0, device=device)
+
+            for layer_pointer_logits, layer_confidence_logits in zip(
+                intermediate_pointer_list, intermediate_confidence_list,
+            ):
+                layer_losses = self._compute_losses(
+                    layer_pointer_logits, layer_confidence_logits,
+                    gt_indices, gt_count,
+                )
+                auxiliary_pointer_loss = (
+                    auxiliary_pointer_loss + layer_losses['pointer_focal_loss']
+                )
+                auxiliary_confidence_loss = (
+                    auxiliary_confidence_loss + layer_losses['confidence_bce_loss']
+                )
+
+            num_auxiliary_layers = len(intermediate_pointer_list)
+            if num_auxiliary_layers > 0:
+                auxiliary_pointer_loss = auxiliary_pointer_loss / num_auxiliary_layers
+                auxiliary_confidence_loss = (
+                    auxiliary_confidence_loss / num_auxiliary_layers
+                )
+
+            # L_aux = w_aux × (w_ptr × mean(FL_layer) + w_conf × mean(BCE_layer))
+            auxiliary_loss = self.auxiliary_loss_weight * (
+                self.pointer_loss_weight * auxiliary_pointer_loss
+                + self.confidence_loss_weight * auxiliary_confidence_loss
+            )
+
+            # Total loss = final-layer losses + auxiliary losses
+            # L_total = w_ptr × FL_final + w_conf × BCE_final + L_aux
+            total_loss = (
+                self.pointer_loss_weight * pointer_focal_loss
+                + self.confidence_loss_weight * confidence_bce_loss
+                + auxiliary_loss
+            )
+
+            return {
+                'pointer_focal_loss': pointer_focal_loss,
+                'confidence_bce_loss': confidence_bce_loss,
+                'auxiliary_loss': auxiliary_loss,
+                'total_loss': total_loss,
+            }
+
+        # Inference: no intermediate outputs needed
         # Step 3: Head forward (trainable)
         pointer_logits, confidence_logits = self.head(
             enriched_features, compact_tokens, mask,
         )
 
-        # Training: compute loss
-        if track_labels is not None:
-            gt_indices, gt_count = self._extract_ground_truth_indices(
-                track_labels, mask,
-            )
-            return self._compute_losses(
-                pointer_logits, confidence_logits, gt_indices, gt_count,
-            )
-
-        # Inference: return logits
         return {
             'pointer_logits': pointer_logits,
             'confidence_logits': confidence_logits,
