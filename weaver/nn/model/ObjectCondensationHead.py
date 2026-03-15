@@ -70,7 +70,7 @@ class ObjectCondensationHead(nn.Module):
     def forward(
         self,
         enriched_features: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Predict beta scores and clustering coordinates per track.
 
         Args:
@@ -80,15 +80,17 @@ class ObjectCondensationHead(nn.Module):
         Returns:
             Tuple of:
                 beta: (B, P) confidence scores ∈ (0, 1) per track.
+                beta_logits: (B, P) pre-sigmoid logits for focal BCE loss.
                 clustering_coordinates: (B, clustering_dim, P) learned
                     embedding coordinates per track.
         """
-        # Beta: (B, input_dim, P) → (B, 1, P) → sigmoid → (B, P)
-        beta = torch.sigmoid(
-            self.beta_head(enriched_features).squeeze(1)
-        )
+        # Beta logits: (B, input_dim, P) → (B, 1, P) → (B, P)
+        beta_logits = self.beta_head(enriched_features).squeeze(1)
+
+        # Beta: sigmoid(logits) → (B, P) ∈ (0, 1)
+        beta = torch.sigmoid(beta_logits)
 
         # Clustering: (B, input_dim, P) → (B, clustering_dim, P)
         clustering_coordinates = self.clustering_head(enriched_features)
 
-        return beta, clustering_coordinates
+        return beta, beta_logits, clustering_coordinates
