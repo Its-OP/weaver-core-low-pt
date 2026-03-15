@@ -19,6 +19,7 @@ Reference:
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 
 class TauTrackFinderHead(nn.Module):
@@ -55,6 +56,7 @@ class TauTrackFinderHead(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        self.backbone_dim = backbone_dim
         self.decoder_dim = decoder_dim
         self.pointer_dim = pointer_dim
         self.num_queries = num_queries
@@ -103,7 +105,11 @@ class TauTrackFinderHead(nn.Module):
             dropout=dropout,
             activation='gelu',
             batch_first=True,
-            norm_first=True,
+            norm_first=False,  # Post-norm (original DETR, Carion et al., ECCV 2020):
+            # Applies LayerNorm AFTER each residual addition, bounding query norms.
+            # Pre-norm (norm_first=True) caused query norms to explode from ~1 to
+            # ~598 across 6 layers, making cross-attention contributions (<0.2% of
+            # residual norm) negligible — decoded queries became input-independent.
         )
         self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer,
@@ -140,16 +146,31 @@ class TauTrackFinderHead(nn.Module):
         # Clamped to min=0.01 to prevent division by near-zero.
         self.temperature = nn.Parameter(torch.ones(1))
 
+        # ---- Pointer Context Projection ----
+        # After computing pointer_logits, each query's soft attention distribution
+        # over tracks is used to read out a "pointed context" vector:
+        #   pointed_context_q = Σ_p softmax(pointer_logits)_{q,p} · enriched_features_p
+        # This projects from backbone feature space to decoder space so it can be
+        # concatenated with decoded queries for the confidence head.
+        self.pointer_context_projection = nn.Sequential(
+            nn.Linear(backbone_dim, decoder_dim),
+            nn.GELU(),
+        )
+
         # ---- Confidence Head ----
         # Per-query binary prediction: does this query point to a real tau
         # track (exists) or is it an unused slot (empty/∅)?
         # At inference: only trust queries with confident "exists" prediction.
         #
+        # Input is concatenation of decoded query (decoder_dim) and pointed
+        # context (decoder_dim), giving the head direct information about WHAT
+        # each query is pointing to — not just the decoded query representation.
+        #
         # Bias initialization: with 15 queries and typically ~3 active (20%),
         # init to logit(0.2) ≈ −1.4 so the network starts with a reasonable
         # prior instead of predicting 50/50.
         self.confidence_head = nn.Sequential(
-            nn.Linear(decoder_dim, pointer_dim),
+            nn.Linear(2 * decoder_dim, pointer_dim),
             nn.GELU(),
             nn.Linear(pointer_dim, 1),
         )
@@ -225,9 +246,31 @@ class TauTrackFinderHead(nn.Module):
             padding_mask, float('-inf'),
         )
 
-        # Step 5: Confidence prediction
+        # Step 5: Compute pointed context — soft-attention readout of enriched
+        # track features weighted by each query's pointer distribution.
+        # pointer_probabilities_{q,p} = softmax(pointer_logits_{q,p}) over tracks
+        # pointed_features_q = Σ_p pointer_probabilities_{q,p} · enriched_features_p
+        pointer_probabilities = functional.softmax(
+            pointer_logits, dim=2,
+        )  # (B, num_queries, P)
+        # enriched_features: (B, backbone_dim, P) → transpose → (B, P, backbone_dim)
+        pointed_features = torch.bmm(
+            pointer_probabilities, enriched_features.transpose(1, 2),
+        )  # (B, num_queries, backbone_dim)
+        pointed_context = self.pointer_context_projection(
+            pointed_features,
+        )  # (B, num_queries, decoder_dim)
+
+        # Step 6: Confidence prediction with pointer context
+        # Concatenate decoded query representation with pointed context so the
+        # confidence head sees both the query's internal state AND what track
+        # features it is pointing to. This breaks the constant-logit equilibrium
+        # where all queries output the same confidence regardless of input.
+        confidence_input = torch.cat(
+            [decoded_queries, pointed_context], dim=-1,
+        )  # (B, num_queries, 2 * decoder_dim)
         confidence_logits = self.confidence_head(
-            decoded_queries,
+            confidence_input,
         ).squeeze(-1)  # (B, num_queries)
 
         return pointer_logits, confidence_logits
