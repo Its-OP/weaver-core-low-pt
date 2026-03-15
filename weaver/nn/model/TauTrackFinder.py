@@ -3,16 +3,18 @@
 Top-level module combining:
     1. Pretrained EnrichCompactBackbone (frozen, no gradients)
     2. TauTrackFinderHead (encoder + decoder + pointer + confidence)
-    3. Loss computation (Hungarian matching + focal pointer + confidence BCE)
+    3. Loss computation (Hungarian matching + pointer CE + confidence BCE)
 
 The task: find up to 6 pion tracks originating from tau decay among ~1130
 tracks per event. Uses 15 learned queries (over-prediction) — excess queries
 learn to predict empty (∅). At inference, queries are ranked by confidence.
 
 Loss components:
-    - Pointer focal loss (Lin et al., ICCV 2017, RetinaNet):
-        For each matched query, focal cross-entropy over ~1130 tracks.
-        FL(p_t) = -α (1 - p_t)^γ log(p_t), α=0.25, γ=2.0
+    - Pointer cross-entropy loss:
+        For each matched query, standard cross-entropy over ~1130 tracks.
+        CE(q, t) = -log softmax(logits)[target]
+        With optional label smoothing (Szegedy et al., CVPR 2016):
+            CE_smooth = (1 - ε) × CE(q, t) + ε × H(uniform, softmax(logits))
     - Confidence BCE loss (Carion et al., ECCV 2020, DETR):
         Binary cross-entropy for exists/∅ on all 15 queries.
     - Hungarian matching (Kuhn, 1955):
@@ -21,7 +23,7 @@ Loss components:
 
 References:
     DETR: https://arxiv.org/abs/2005.12872
-    RetinaNet: https://arxiv.org/abs/1708.02002
+    Label smoothing: Szegedy et al., CVPR 2016
     Hungarian: Kuhn (1955), Naval Research Logistics Quarterly
 """
 import torch
@@ -40,7 +42,7 @@ class TauTrackFinder(nn.Module):
         1. Backbone enrichment (frozen): all tracks → enriched features (B, 256, P)
         2. Backbone compaction (frozen): enriched → compact tokens (B, 256, 128)
         3. Head forward: pointer logits (B, 15, P) + confidence logits (B, 15)
-        4. Loss: Hungarian matching → focal pointer + confidence BCE
+        4. Loss: Hungarian matching → pointer CE + confidence BCE
 
     Training mode returns loss dict. Eval mode returns logits dict.
 
@@ -48,10 +50,12 @@ class TauTrackFinder(nn.Module):
         backbone_kwargs: Keyword arguments for EnrichCompactBackbone.
         decoder_kwargs: Keyword arguments for TauTrackFinderHead.
             Must include 'max_gt_tracks' (default: 6).
-        pointer_loss_weight: Weight for pointer focal loss (default: 5.0).
+        pointer_loss_weight: Weight for pointer cross-entropy loss (default: 5.0).
         confidence_loss_weight: Weight for confidence BCE loss (default: 1.0).
-        focal_alpha: Alpha parameter for focal loss (default: 0.25).
-        focal_gamma: Gamma parameter for focal loss (default: 2.0).
+        label_smoothing: Label smoothing parameter ε for pointer CE (default: 0.0).
+            When ε > 0, the target distribution is smoothed:
+            CE_smooth = (1 - ε) × CE(q, t) + ε × H(uniform, softmax(logits)).
+            Typical value: 0.1. Prevents overconfident pointer predictions.
     """
 
     def __init__(
@@ -60,8 +64,7 @@ class TauTrackFinder(nn.Module):
         decoder_kwargs: dict | None = None,
         pointer_loss_weight: float = 5.0,
         confidence_loss_weight: float = 1.0,
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
+        label_smoothing: float = 0.0,
     ):
         super().__init__()
 
@@ -72,8 +75,7 @@ class TauTrackFinder(nn.Module):
 
         self.pointer_loss_weight = pointer_loss_weight
         self.confidence_loss_weight = confidence_loss_weight
-        self.focal_alpha = focal_alpha
-        self.focal_gamma = focal_gamma
+        self.label_smoothing = label_smoothing
 
         # Maximum number of GT tracks per event
         self.max_gt_tracks = decoder_kwargs.pop('max_gt_tracks', 6)
@@ -189,40 +191,36 @@ class TauTrackFinder(nn.Module):
 
         return cost_matrix
 
-    def _focal_loss(
+    def _pointer_cross_entropy(
         self,
         logits: torch.Tensor,
-        targets: torch.Tensor,
+        target: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute focal cross-entropy loss over tracks for one query-GT pair.
+        """Compute cross-entropy loss for one query pointing to a GT track.
 
-        Focal loss (Lin et al., RetinaNet, ICCV 2017):
-            FL(p_t) = -α_t (1 - p_t)^γ log(p_t)
+        Standard cross-entropy: CE(q, t) = -log softmax(logits)[target]
 
-        where p_t = softmax(logits)[target_index] and α_t is the class weight.
-        The (1 - p_t)^γ modulating factor downweights easy examples (where the
-        model is already confident), focusing training on hard examples.
+        With optional label smoothing (Szegedy et al., CVPR 2016):
+            CE_smooth = (1 - ε) × CE(q, t) + ε × H(uniform, softmax(logits))
+
+        where ε is the smoothing parameter and H is the cross-entropy with
+        uniform distribution. This prevents overconfident pointer predictions
+        and improves generalization.
 
         Args:
             logits: (P,) raw pointer logits for one query over P tracks.
-            targets: scalar index of the correct track.
+            target: scalar index of the correct track.
 
         Returns:
-            Scalar focal loss value.
+            Scalar cross-entropy loss value.
         """
-        # log_softmax for numerical stability: log P(track_i) for all tracks
-        log_probabilities = functional.log_softmax(logits, dim=0)  # (P,)
-        probabilities = log_probabilities.exp()  # (P,)
-
-        # p_t = P(correct track)
-        log_probability_target = log_probabilities[targets]
-        probability_target = probabilities[targets]
-
-        # FL = -α (1 - p_t)^γ log(p_t)
-        focal_weight = self.focal_alpha * (
-            (1.0 - probability_target) ** self.focal_gamma
+        # functional.cross_entropy expects (C,) logits and scalar target
+        # unsqueeze to (1, C) and (1,) for the batch dimension
+        return functional.cross_entropy(
+            logits.unsqueeze(0),
+            target.unsqueeze(0),
+            label_smoothing=self.label_smoothing,
         )
-        return -focal_weight * log_probability_target
 
     def _compute_losses(
         self,
@@ -231,12 +229,12 @@ class TauTrackFinder(nn.Module):
         gt_indices: torch.Tensor,
         gt_count: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Compute pointer focal loss and confidence BCE loss.
+        """Compute pointer cross-entropy loss and confidence BCE loss.
 
         Steps:
             1. Build cost matrix (B, num_queries, max_gt_tracks)
             2. Hungarian matching → optimal query-to-GT assignment
-            3. Pointer focal loss on matched queries only
+            3. Pointer cross-entropy loss on matched queries only
             4. Confidence BCE loss on all queries
 
         Args:
@@ -246,7 +244,7 @@ class TauTrackFinder(nn.Module):
             gt_count: (B,) number of valid GT tracks per event.
 
         Returns:
-            Dict with 'pointer_focal_loss', 'confidence_bce_loss', 'total_loss'.
+            Dict with 'pointer_ce_loss', 'confidence_bce_loss', 'total_loss'.
         """
         batch_size = pointer_logits.shape[0]
         num_queries = pointer_logits.shape[1]
@@ -271,7 +269,7 @@ class TauTrackFinder(nn.Module):
         )  # (B, max_gt): actual track index for each match
         match_is_valid = matched_gt_track_indices != -1  # (B, max_gt)
 
-        # Step 3: Pointer focal loss — only on validly matched queries
+        # Step 3: Pointer cross-entropy loss — only on validly matched queries
         total_pointer_loss = torch.tensor(0.0, device=device)
         num_matched_total = 0
 
@@ -283,18 +281,18 @@ class TauTrackFinder(nn.Module):
                 query_index = matched_query_indices[batch_index, match_slot]
                 target_track = matched_gt_track_indices[batch_index, match_slot]
 
-                # Focal loss for this query pointing to this GT track
+                # Cross-entropy loss for this query pointing to this GT track
                 query_logits = pointer_logits[batch_index, query_index]  # (P,)
-                total_pointer_loss = total_pointer_loss + self._focal_loss(
+                total_pointer_loss = total_pointer_loss + self._pointer_cross_entropy(
                     query_logits, target_track,
                 )
                 num_matched_total += 1
 
         # Average over matched pairs (avoid division by zero)
         if num_matched_total > 0:
-            pointer_focal_loss = total_pointer_loss / num_matched_total
+            pointer_ce_loss = total_pointer_loss / num_matched_total
         else:
-            pointer_focal_loss = torch.tensor(0.0, device=device)
+            pointer_ce_loss = torch.tensor(0.0, device=device)
 
         # Step 4: Confidence BCE loss — all queries
         # Build confidence targets: 1 for queries matched to real GT, 0 otherwise
@@ -313,12 +311,12 @@ class TauTrackFinder(nn.Module):
 
         # Step 5: Weighted total loss
         total_loss = (
-            self.pointer_loss_weight * pointer_focal_loss
+            self.pointer_loss_weight * pointer_ce_loss
             + self.confidence_loss_weight * confidence_bce_loss
         )
 
         return {
-            'pointer_focal_loss': pointer_focal_loss,
+            'pointer_ce_loss': pointer_ce_loss,
             'confidence_bce_loss': confidence_bce_loss,
             'total_loss': total_loss,
         }
@@ -342,7 +340,7 @@ class TauTrackFinder(nn.Module):
                 1.0 = tau-origin pion, 0.0 = background/padding.
 
         Returns:
-            Training: dict with 'total_loss', 'pointer_focal_loss',
+            Training: dict with 'total_loss', 'pointer_ce_loss',
                 'confidence_bce_loss' (all scalar tensors).
             Inference: dict with 'pointer_logits' (B, num_queries, P) and
                 'confidence_logits' (B, num_queries).
