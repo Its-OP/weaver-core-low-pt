@@ -15,6 +15,9 @@ Loss components:
         FL(p_t) = -α (1 - p_t)^γ log(p_t), α=0.25, γ=2.0
     - Confidence BCE loss (Carion et al., ECCV 2020, DETR):
         Binary cross-entropy for exists/∅ on all 15 queries.
+        Uses DETR-style no-object coefficient (eos_coef, default 0.1) to
+        downweight empty (∅) targets, preventing the model from trivially
+        minimizing loss by always predicting "no object".
     - Hungarian matching (Kuhn, 1955):
         Optimal 1-to-1 assignment of queries to GT tracks (no gradients).
         Reuses existing hungarian_matcher from weaver.
@@ -52,6 +55,11 @@ class TauTrackFinder(nn.Module):
         confidence_loss_weight: Weight for confidence BCE loss (default: 1.0).
         focal_alpha: Alpha parameter for focal loss (default: 0.25).
         focal_gamma: Gamma parameter for focal loss (default: 2.0).
+        no_object_weight: DETR-style eos_coef (Carion et al., ECCV 2020).
+            Weight applied to "empty" (no-object) targets in confidence BCE.
+            With 15 queries and ~3 GT tracks, 80% of targets are empty.
+            Downweighting empty targets prevents the model from trivially
+            minimizing loss by always predicting "no object" (default: 0.1).
     """
 
     def __init__(
@@ -62,6 +70,7 @@ class TauTrackFinder(nn.Module):
         confidence_loss_weight: float = 1.0,
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
+        no_object_weight: float = 0.1,
     ):
         super().__init__()
 
@@ -74,6 +83,7 @@ class TauTrackFinder(nn.Module):
         self.confidence_loss_weight = confidence_loss_weight
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
+        self.no_object_weight = no_object_weight
 
         # Maximum number of GT tracks per event
         self.max_gt_tracks = decoder_kwargs.pop('max_gt_tracks', 6)
@@ -307,8 +317,23 @@ class TauTrackFinder(nn.Module):
                     query_index = matched_query_indices[batch_index, match_slot]
                     confidence_targets[batch_index, query_index] = 1.0
 
+        # DETR-style no-object coefficient (eos_coef, Carion et al., ECCV 2020):
+        # Downweight the "empty" (∅) class in confidence BCE to prevent the
+        # model from trivially minimizing loss by always predicting "no object".
+        # With 15 queries and ~3 GT tracks, 80% of targets are empty. Without
+        # downweighting, the gradient from 12 "predict empty" targets overwhelms
+        # the gradient from 3 "predict exists" targets.
+        #
+        # Weight scheme:
+        #   - Matched queries (exists):  weight = 1.0
+        #   - Unmatched queries (empty): weight = no_object_weight (default 0.1)
+        confidence_weights = torch.where(
+            confidence_targets == 1.0,
+            torch.ones_like(confidence_targets),
+            torch.full_like(confidence_targets, self.no_object_weight),
+        )
         confidence_bce_loss = functional.binary_cross_entropy_with_logits(
-            confidence_logits, confidence_targets,
+            confidence_logits, confidence_targets, weight=confidence_weights,
         )
 
         # Step 5: Weighted total loss
