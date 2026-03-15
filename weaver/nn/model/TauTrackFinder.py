@@ -6,7 +6,8 @@ Top-level module combining:
     2. TauTrackFinderHead (encoder + dual-cross-attention decoder + mask + confidence)
     3. DN-DETR denoising training (training only)
     4. Auxiliary losses at every decoder layer
-    5. Loss computation: cross-entropy for masks, BCE for confidence
+    5. One-to-many auxiliary matching (training only)
+    6. Loss computation: cross-entropy for masks, BCE for confidence
 
 The task: find up to 6 pion tracks originating from tau decay among ~1130
 tracks per event. Uses learned queries (over-prediction) with mask-based
@@ -36,10 +37,19 @@ Loss components:
     - Auxiliary losses (Carion et al., DETR, ECCV 2020):
         Losses computed at every decoder layer, not just the last.
         Provides direct supervision to intermediate representations.
+    - One-to-many auxiliary matching (Group DETR, ICCV 2023):
+        After the standard one-to-one Hungarian matching, each GT track is
+        matched to the top-K queries by cost. This K× amplifies positive
+        gradient signal. With one-to-one matching, only ~3 out of 30 queries
+        get positive gradient per batch (90% learn "predict nothing"). The
+        auxiliary one-to-many loss is applied only on the last decoder layer.
+        At inference: unchanged (one-to-one only).
 
 References:
     DETR: https://arxiv.org/abs/2005.12872
     DN-DETR: https://arxiv.org/abs/2203.01305
+    Group DETR: https://arxiv.org/abs/2207.13085
+    Hybrid DETR: https://arxiv.org/abs/2304.04742
     Hungarian: Kuhn (1955), Naval Research Logistics Quarterly
 """
 import torch
@@ -93,6 +103,18 @@ class TauTrackFinder(nn.Module):
             where ε = label_smoothing, u = uniform distribution, and H is
             the cross-entropy. Equivalent to:
                 F.cross_entropy(logits, target, label_smoothing=ε)
+        one_to_many_k: Number of queries matched to each GT track in the
+            auxiliary one-to-many loss (default: 0, disabled). When > 0,
+            each GT track is matched to the top-K queries with lowest cost,
+            providing K× more positive gradient signal than one-to-one
+            matching alone. Only applied on the last decoder layer's
+            learnable query outputs to limit computational overhead.
+            Reference: Group DETR (ICCV 2023), https://arxiv.org/abs/2207.13085
+        one_to_many_weight: Weight for the auxiliary one-to-many loss
+            (default: 0.5). Scales the combined one-to-many mask CE and
+            confidence losses before adding to total loss. Set lower than
+            1.0 so the primary one-to-one matching remains dominant:
+                L_otm = w_otm * (w_mask * CE_otm + w_conf * BCE_otm)
     """
 
     def __init__(
@@ -106,6 +128,8 @@ class TauTrackFinder(nn.Module):
         num_denoising_groups: int = 5,
         denoising_noise_scale: float = 0.5,
         label_smoothing: float = 0.1,
+        one_to_many_k: int = 0,
+        one_to_many_weight: float = 0.5,
     ):
         super().__init__()
 
@@ -121,6 +145,8 @@ class TauTrackFinder(nn.Module):
         self.num_denoising_groups = num_denoising_groups
         self.denoising_noise_scale = denoising_noise_scale
         self.label_smoothing = label_smoothing
+        self.one_to_many_k = one_to_many_k
+        self.one_to_many_weight = one_to_many_weight
 
         # Maximum number of GT tracks per event
         self.max_gt_tracks = decoder_kwargs.pop('max_gt_tracks', 6)
@@ -622,6 +648,147 @@ class TauTrackFinder(nn.Module):
             'denoising_confidence_loss': denoising_confidence_loss,
         }
 
+    def _compute_one_to_many_losses(
+        self,
+        mask_logits: torch.Tensor,
+        confidence_logits: torch.Tensor,
+        ground_truth_indices: torch.Tensor,
+        ground_truth_count: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute auxiliary one-to-many matching losses.
+
+        For each valid GT track, find the top-K queries with lowest cost
+        from the cost matrix and compute CE mask + confidence losses for
+        all K queries. This provides K× more positive gradient signal
+        than one-to-one matching alone.
+
+        With one-to-one Hungarian matching, only ~3 out of 30 queries get
+        positive gradient per batch (90% learn "predict nothing"). This
+        auxiliary loss assigns K queries per GT track, amplifying the sparse
+        positive signal. The cost matrix is detached to prevent gradient
+        flow through the matching itself (following standard DETR practice).
+
+        One-to-many mask CE loss (for each of K matched queries per GT):
+            CE_otm = -log(softmax(mask_logits[query])[gt_track_index])
+
+        One-to-many confidence BCE (all queries):
+            BCE_otm = BCE(confidence_logits, targets)
+            where targets[matched_queries] = 1, rest = 0
+
+        References:
+            Group DETR (ICCV 2023): https://arxiv.org/abs/2207.13085
+            Hybrid DETR (CVPR 2023): https://arxiv.org/abs/2304.04742
+
+        Args:
+            mask_logits: (B, num_queries, P) mask prediction logits.
+                Padded positions have logits = -inf.
+            confidence_logits: (B, num_queries) confidence scores.
+            ground_truth_indices: (B, max_gt_tracks) GT track indices
+                (-1 = invalid).
+            ground_truth_count: (B,) number of valid GT tracks per event.
+            mask: (B, 1, P) boolean mask, True for valid tracks.
+
+        Returns:
+            Dict with:
+                'one_to_many_mask_ce': Cross-entropy mask loss averaged
+                    over all K×GT matched pairs.
+                'one_to_many_confidence': Confidence BCE loss with
+                    no_object_weight for unmatched queries.
+        """
+        device = mask_logits.device
+        batch_size = mask_logits.shape[0]
+        num_queries = mask_logits.shape[1]
+
+        # Step 1: Compute cost matrix (B, Q, max_gt) — reuse existing method
+        cost_matrix = self._compute_cost_matrix(
+            mask_logits, confidence_logits,
+            ground_truth_indices, ground_truth_count,
+        )
+
+        # Step 2: For each GT slot, find top-K queries with lowest cost.
+        # Transpose cost matrix: (B, Q, max_gt) → (B, max_gt, Q)
+        # so torch.topk operates over the query dimension.
+        cost_transposed = cost_matrix.detach().transpose(1, 2)  # (B, max_gt, Q)
+
+        # Clamp K to not exceed the number of available queries
+        effective_k = min(self.one_to_many_k, num_queries)
+
+        # Top-K lowest cost queries per GT slot: (B, max_gt, K)
+        _, topk_query_indices = cost_transposed.topk(
+            effective_k, dim=-1, largest=False,
+        )
+
+        # Step 3: Build matched pairs — for each valid GT × K queries,
+        # collect (batch_idx, query_idx, gt_track_idx) triples.
+        # Vectorized construction using broadcasting instead of Python loops.
+
+        # Valid GT mask: (B, max_gt) — True where GT slot has a real track
+        valid_gt_mask = ground_truth_indices >= 0  # (B, max_gt)
+
+        # Expand valid mask to cover all K matches: (B, max_gt, K)
+        valid_gt_expanded = valid_gt_mask.unsqueeze(2).expand(
+            -1, -1, effective_k,
+        )
+
+        # Get flat indices of all valid (batch, gt_slot, k) combinations
+        valid_batch_indices, valid_gt_slot_indices, valid_k_indices = (
+            valid_gt_expanded.nonzero(as_tuple=True)
+        )
+
+        if valid_batch_indices.numel() == 0:
+            return {
+                'one_to_many_mask_ce': torch.tensor(0.0, device=device),
+                'one_to_many_confidence': torch.tensor(0.0, device=device),
+            }
+
+        # Gather the matched query indices and GT track indices
+        matched_query_indices = topk_query_indices[
+            valid_batch_indices, valid_gt_slot_indices, valid_k_indices,
+        ]
+        matched_gt_track_indices = ground_truth_indices[
+            valid_batch_indices, valid_gt_slot_indices,
+        ]
+
+        # Step 4: Cross-entropy mask loss for all K×GT matched pairs.
+        # For each matched (query, GT track) pair:
+        #   CE = -log(softmax(mask_logits[query])[gt_track_index])
+        matched_logits = mask_logits[
+            valid_batch_indices, matched_query_indices,
+        ]  # (num_matched, P)
+
+        # Clamp -inf for label smoothing compatibility (see
+        # _compute_losses_single_layer for detailed explanation).
+        matched_logits = matched_logits.clamp(min=-1e9)
+
+        one_to_many_mask_ce = functional.cross_entropy(
+            matched_logits, matched_gt_track_indices.long(),
+            label_smoothing=self.label_smoothing,
+        )
+
+        # Step 5: Confidence BCE — matched queries get target=1, rest get
+        # target=0 with no_object_weight downweighting.
+        confidence_targets = torch.zeros(
+            batch_size, num_queries, device=device,
+        )
+        confidence_targets[
+            valid_batch_indices, matched_query_indices,
+        ] = 1.0
+
+        confidence_weights = torch.where(
+            confidence_targets == 1.0,
+            torch.ones_like(confidence_targets),
+            torch.full_like(confidence_targets, self.no_object_weight),
+        )
+        one_to_many_confidence = functional.binary_cross_entropy_with_logits(
+            confidence_logits, confidence_targets, weight=confidence_weights,
+        )
+
+        return {
+            'one_to_many_mask_ce': one_to_many_mask_ce,
+            'one_to_many_confidence': one_to_many_confidence,
+        }
+
     def forward(
         self,
         points: torch.Tensor,
@@ -794,12 +961,37 @@ class TauTrackFinder(nn.Module):
                 + self.confidence_loss_weight * averaged_denoising_confidence
             )
 
-            # Total loss: weighted sum of learnable + denoising losses
-            # total = w_mask * CE_mask + w_conf * BCE_conf + w_dn * (w_mask * CE_dn_mask + w_conf * BCE_dn_conf)
+            # ---- One-to-many auxiliary loss (Group DETR, ICCV 2023) ----
+            # Applied only on the LAST decoder layer's learnable outputs to
+            # limit computational overhead. Each GT track is matched to the
+            # top-K queries by cost, providing K× more positive gradient
+            # signal than one-to-one Hungarian matching alone.
+            #   L_otm = w_otm * (w_mask * CE_otm + w_conf * BCE_otm)
+            if self.one_to_many_k > 0 and self.one_to_many_weight > 0:
+                one_to_many_losses = self._compute_one_to_many_losses(
+                    last_learnable_mask, last_learnable_conf,
+                    ground_truth_indices, ground_truth_count, mask,
+                )
+                one_to_many_total = self.one_to_many_weight * (
+                    self.mask_ce_loss_weight
+                    * one_to_many_losses['one_to_many_mask_ce']
+                    + self.confidence_loss_weight
+                    * one_to_many_losses['one_to_many_confidence']
+                )
+            else:
+                one_to_many_total = torch.tensor(
+                    0.0, device=enriched_features.device,
+                )
+
+            # Total loss: weighted sum of learnable + denoising + one-to-many
+            # total = w_mask * CE_mask + w_conf * BCE_conf
+            #       + w_dn * (w_mask * CE_dn_mask + w_conf * BCE_dn_conf)
+            #       + w_otm * (w_mask * CE_otm + w_conf * BCE_otm)
             total_loss = (
                 self.mask_ce_loss_weight * averaged_mask_ce_loss
                 + self.confidence_loss_weight * averaged_confidence_loss
                 + denoising_total
+                + one_to_many_total
             )
 
             return {
@@ -807,6 +999,7 @@ class TauTrackFinder(nn.Module):
                 'mask_ce_loss': averaged_mask_ce_loss,
                 'confidence_loss': averaged_confidence_loss,
                 'denoising_loss': denoising_total,
+                'one_to_many_loss': one_to_many_total,
             }
 
         # ---- Inference mode ----

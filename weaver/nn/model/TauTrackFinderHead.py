@@ -28,10 +28,198 @@ References:
     Cheng, B. et al. "Masked-attention Mask Transformer for Universal
     Image Segmentation." CVPR 2022. (Mask2Former -- dual cross-attention)
 """
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 from weaver.nn.model.HierarchicalGraphBackbone import farthest_point_sampling
+
+
+class QKNormMultiheadAttention(nn.Module):
+    """Multi-head attention with L2-normalized queries and keys.
+
+    Standard attention computes:
+        Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_head)) @ V
+
+    With QK-Norm, Q and K are L2-normalized per head AFTER projection,
+    then scaled by a learnable per-head temperature (initialized to sqrt(d_head)):
+        Q_norm = Q / ||Q||_2
+        K_norm = K / ||K||_2
+        Attention(Q, K, V) = softmax(Q_norm @ K_norm^T * temperature) @ V
+
+    This bounds attention logits to [-1, 1] * temperature, preventing
+    softmax collapse to one-hot when Q/K norms grow during training.
+
+    References:
+        - Used in Gemini 2.0, DeepSeek-V3, LLaMA 3.1
+        - arXiv:2511.21377 "Controlling Changes to Attention Logits"
+
+    Args:
+        embed_dim: Total dimension of the model (must be divisible by num_heads).
+        num_heads: Number of parallel attention heads.
+        dropout: Dropout probability on attention weights. Default: 0.0.
+        batch_first: If True, input/output tensors are (batch, sequence, feature).
+            Always True in this implementation (our convention).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        batch_first: bool = True,
+    ):
+        super().__init__()
+        assert embed_dim % num_heads == 0, (
+            f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+        )
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.dropout = dropout
+
+        # Separate Q, K, V projections (not fused) for clarity.
+        # Each projects from embed_dim to embed_dim.
+        self.query_projection = nn.Linear(embed_dim, embed_dim)
+        self.key_projection = nn.Linear(embed_dim, embed_dim)
+        self.value_projection = nn.Linear(embed_dim, embed_dim)
+        self.output_projection = nn.Linear(embed_dim, embed_dim)
+
+        # Learnable per-head temperature, initialized to sqrt(d_head).
+        # After L2 normalization, Q_norm @ K_norm^T lies in [-1, 1].
+        # Multiplying by temperature = sqrt(d_head) recovers the standard
+        # attention logit scale at initialization:
+        #   logits = (Q_norm @ K_norm^T) * temperature
+        # Shape: (num_heads,), broadcast as (1, num_heads, 1, 1) during forward.
+        self.head_temperature = nn.Parameter(
+            torch.full((num_heads,), math.sqrt(self.head_dim))
+        )
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        """Forward pass with QK-normalized multi-head attention.
+
+        Args:
+            query: (B, S_q, embed_dim) query tensor.
+            key: (B, S_kv, embed_dim) key tensor.
+            value: (B, S_kv, embed_dim) value tensor.
+            key_padding_mask: (B, S_kv) boolean mask where True = padded (ignore).
+                Expanded to (B, 1, 1, S_kv) for broadcasting with attention logits.
+            attn_mask: (S_q, S_kv) or (B*num_heads, S_q, S_kv) boolean mask
+                where True = ignore. Converted to additive float mask (-inf)
+                for F.scaled_dot_product_attention.
+
+        Returns:
+            Tuple of (attention_output, None):
+                attention_output: (B, S_q, embed_dim) result tensor.
+                None: placeholder for attention weights (not computed).
+        """
+        batch_size, query_sequence_length, _ = query.shape
+        _, key_sequence_length, _ = key.shape
+
+        # Step 1: Project Q, K, V through separate linear layers
+        projected_query = self.query_projection(query)    # (B, S_q, embed_dim)
+        projected_key = self.key_projection(key)          # (B, S_kv, embed_dim)
+        projected_value = self.value_projection(value)    # (B, S_kv, embed_dim)
+
+        # Step 2: Reshape to multi-head format (B, num_heads, S, head_dim)
+        projected_query = projected_query.view(
+            batch_size, query_sequence_length, self.num_heads, self.head_dim,
+        ).transpose(1, 2)  # (B, num_heads, S_q, head_dim)
+
+        projected_key = projected_key.view(
+            batch_size, key_sequence_length, self.num_heads, self.head_dim,
+        ).transpose(1, 2)  # (B, num_heads, S_kv, head_dim)
+
+        projected_value = projected_value.view(
+            batch_size, key_sequence_length, self.num_heads, self.head_dim,
+        ).transpose(1, 2)  # (B, num_heads, S_kv, head_dim)
+
+        # Step 3: L2-normalize Q and K along the head dimension (last dim)
+        # Q_norm = Q / ||Q||_2, K_norm = K / ||K||_2
+        # This bounds the dot product Q_norm @ K_norm^T to [-1, 1] per element
+        normalized_query = functional.normalize(
+            projected_query, dim=-1,
+        )  # (B, num_heads, S_q, head_dim)
+        normalized_key = functional.normalize(
+            projected_key, dim=-1,
+        )  # (B, num_heads, S_kv, head_dim)
+
+        # Step 4: Scale Q by learnable per-head temperature
+        # logits = (Q_norm * temperature) @ K_norm^T
+        #        = (Q_norm @ K_norm^T) * temperature
+        # Broadcast temperature (num_heads,) -> (1, num_heads, 1, 1)
+        temperature_broadcast = self.head_temperature.view(
+            1, self.num_heads, 1, 1,
+        )
+        scaled_query = normalized_query * temperature_broadcast
+
+        # Step 5: Build combined attention mask for F.scaled_dot_product_attention
+        # SDPA expects additive float mask where -inf = ignore, 0.0 = attend
+        combined_attention_mask = None
+
+        if attn_mask is not None:
+            # attn_mask: boolean (True=ignore) -> additive float (-inf=ignore)
+            if attn_mask.dim() == 2:
+                # (S_q, S_kv) -> (1, 1, S_q, S_kv) for broadcasting
+                combined_attention_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+            elif attn_mask.dim() == 3:
+                # (B*num_heads, S_q, S_kv) -> (B, num_heads, S_q, S_kv)
+                combined_attention_mask = attn_mask.view(
+                    batch_size, self.num_heads,
+                    query_sequence_length, key_sequence_length,
+                )
+            # Convert boolean mask to additive float mask
+            combined_attention_mask = torch.zeros_like(
+                combined_attention_mask, dtype=scaled_query.dtype,
+            ).masked_fill(combined_attention_mask, float('-inf'))
+
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, S_kv) boolean, True = padded (ignore)
+            # Expand to (B, 1, 1, S_kv) for broadcasting across heads and queries
+            padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            # Convert to additive float mask
+            padding_mask = torch.zeros_like(
+                padding_mask, dtype=scaled_query.dtype,
+            ).masked_fill(padding_mask, float('-inf'))
+
+            if combined_attention_mask is not None:
+                # Combine both masks: either one saying -inf means ignore
+                combined_attention_mask = combined_attention_mask + padding_mask
+            else:
+                combined_attention_mask = padding_mask
+
+        # Step 6: Compute attention via F.scaled_dot_product_attention
+        # We set scale=1.0 because we already applied our own temperature scaling.
+        # SDPA computes: softmax(scaled_query @ K^T * scale + attn_mask) @ V
+        # With scale=1.0: softmax(scaled_query @ K_norm^T + mask) @ V
+        attention_output = functional.scaled_dot_product_attention(
+            query=scaled_query,
+            key=normalized_key,
+            value=projected_value,
+            attn_mask=combined_attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            scale=1.0,  # We handle scaling ourselves via head_temperature
+        )  # (B, num_heads, S_q, head_dim)
+
+        # Step 7: Reshape back to (B, S_q, embed_dim) and apply output projection
+        attention_output = attention_output.transpose(1, 2).contiguous().view(
+            batch_size, query_sequence_length, self.embed_dim,
+        )  # (B, S_q, embed_dim)
+        attention_output = self.output_projection(attention_output)
+
+        # Return (output, None) to match nn.MultiheadAttention interface.
+        # We don't compute attention weights (not needed for training).
+        return attention_output, None
 
 
 class DropPath(nn.Module):
@@ -113,6 +301,8 @@ class DualCrossAttentionDecoderLayer(nn.Module):
         num_heads: Number of attention heads in each MultiheadAttention.
         dim_feedforward: Hidden dimension of the feed-forward network.
         dropout: Dropout rate applied in attention and FFN.
+        layer_scale_init: Initial value for LayerScale gamma parameters.
+            Set to 0 or negative to disable LayerScale (default: 1e-4).
     """
 
     def __init__(
@@ -121,36 +311,37 @@ class DualCrossAttentionDecoderLayer(nn.Module):
         num_heads: int,
         dim_feedforward: int,
         dropout: float,
+        layer_scale_init: float = 1e-4,
     ):
         super().__init__()
 
-        # Sublayer 1: Self-attention among queries for coordination
+        # Sublayer 1: Self-attention among queries for coordination.
         # Prevents multiple queries from converging to the same track.
-        self.self_attention = nn.MultiheadAttention(
+        # Uses QK-Norm to bound attention logits and prevent softmax collapse.
+        self.self_attention = QKNormMultiheadAttention(
             embed_dim=decoder_dim,
             num_heads=num_heads,
             dropout=dropout,
-            batch_first=True,
         )
 
-        # Sublayer 2: Cross-attention to encoded compact tokens
+        # Sublayer 2: Cross-attention to encoded compact tokens.
         # Queries attend to 128 compact spatial tokens for global event context.
-        self.compact_cross_attention = nn.MultiheadAttention(
+        # Uses QK-Norm to bound attention logits and prevent softmax collapse.
+        self.compact_cross_attention = QKNormMultiheadAttention(
             embed_dim=decoder_dim,
             num_heads=num_heads,
             dropout=dropout,
-            batch_first=True,
         )
 
-        # Sublayer 3: Cross-attention to enriched per-track features
+        # Sublayer 3: Cross-attention to enriched per-track features.
         # Queries attend to ~1130 enriched track features for fine-grained
         # track identity information. Uses track_padding_mask to ignore
         # padded track positions.
-        self.track_cross_attention = nn.MultiheadAttention(
+        # Uses QK-Norm to bound attention logits and prevent softmax collapse.
+        self.track_cross_attention = QKNormMultiheadAttention(
             embed_dim=decoder_dim,
             num_heads=num_heads,
             dropout=dropout,
-            batch_first=True,
         )
 
         # Sublayer 4: Feed-forward network
@@ -174,6 +365,31 @@ class DualCrossAttentionDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
         self.dropout4 = nn.Dropout(dropout)
+
+        # LayerScale (CaiT, Touvron et al., ICCV 2021):
+        # Learnable per-channel scaling gamma on each sublayer output,
+        # initialized to a small value (default 1e-4).
+        # output = LayerNorm(x + dropout(gamma * sublayer(x)))
+        # Prevents early layers from dominating the residual stream in
+        # deep networks by starting with near-identity residual connections.
+        if layer_scale_init > 0:
+            self.layer_scale_1 = nn.Parameter(
+                layer_scale_init * torch.ones(decoder_dim),
+            )
+            self.layer_scale_2 = nn.Parameter(
+                layer_scale_init * torch.ones(decoder_dim),
+            )
+            self.layer_scale_3 = nn.Parameter(
+                layer_scale_init * torch.ones(decoder_dim),
+            )
+            self.layer_scale_4 = nn.Parameter(
+                layer_scale_init * torch.ones(decoder_dim),
+            )
+        else:
+            self.layer_scale_1 = None
+            self.layer_scale_2 = None
+            self.layer_scale_3 = None
+            self.layer_scale_4 = None
 
     def forward(
         self,
@@ -201,26 +417,33 @@ class DualCrossAttentionDecoderLayer(nn.Module):
             queries: (B, num_queries, decoder_dim) updated query embeddings.
         """
         # Sublayer 1: Self-attention among queries
-        # output = LayerNorm(dropout(SelfAttn(Q, Q, Q)) + Q)
+        # With LayerScale: output = LayerNorm(x + dropout(gamma_1 * SelfAttn(Q, Q, Q)))
+        # Without LayerScale: output = LayerNorm(x + dropout(SelfAttn(Q, Q, Q)))
         self_attention_output, _ = self.self_attention(
             query=queries,
             key=queries,
             value=queries,
             attn_mask=self_attention_mask,
         )
+        if self.layer_scale_1 is not None:
+            self_attention_output = self.layer_scale_1 * self_attention_output
         queries = self.norm1(queries + self.dropout1(self_attention_output))
 
         # Sublayer 2: Cross-attention to compact tokens (global context)
-        # output = LayerNorm(dropout(CrossAttn(Q, K_compact, V_compact)) + Q)
+        # With LayerScale: output = LayerNorm(x + dropout(gamma_2 * CrossAttn(Q, K, V)))
+        # Without LayerScale: output = LayerNorm(x + dropout(CrossAttn(Q, K, V)))
         compact_cross_output, _ = self.compact_cross_attention(
             query=queries,
             key=compact_memory,
             value=compact_memory,
         )
+        if self.layer_scale_2 is not None:
+            compact_cross_output = self.layer_scale_2 * compact_cross_output
         queries = self.norm2(queries + self.dropout2(compact_cross_output))
 
         # Sublayer 3: Cross-attention to enriched tracks (fine-grained identity)
-        # output = LayerNorm(dropout(CrossAttn(Q, K_track, V_track)) + Q)
+        # With LayerScale: output = LayerNorm(x + dropout(gamma_3 * CrossAttn(Q, K, V)))
+        # Without LayerScale: output = LayerNorm(x + dropout(CrossAttn(Q, K, V)))
         # track_padding_mask: (B, P) where True = padded positions to ignore
         track_cross_output, _ = self.track_cross_attention(
             query=queries,
@@ -228,11 +451,16 @@ class DualCrossAttentionDecoderLayer(nn.Module):
             value=track_memory,
             key_padding_mask=track_padding_mask,
         )
+        if self.layer_scale_3 is not None:
+            track_cross_output = self.layer_scale_3 * track_cross_output
         queries = self.norm3(queries + self.dropout3(track_cross_output))
 
         # Sublayer 4: Feed-forward network
-        # output = LayerNorm(dropout(FFN(Q)) + Q)
+        # With LayerScale: output = LayerNorm(x + dropout(gamma_4 * FFN(Q)))
+        # Without LayerScale: output = LayerNorm(x + dropout(FFN(Q)))
         ffn_output = self.ffn(queries)
+        if self.layer_scale_4 is not None:
+            ffn_output = self.layer_scale_4 * ffn_output
         queries = self.norm4(queries + self.dropout4(ffn_output))
 
         return queries
@@ -277,6 +505,11 @@ class TauTrackFinderHead(nn.Module):
             randomly skipping layer contributions during training.
             Reference: Huang et al., "Deep Networks with Stochastic Depth",
             ECCV 2016.
+        layer_scale_init: Initial value for LayerScale gamma parameters in
+            each decoder layer (default: 1e-4). Set to 0 or negative to
+            disable LayerScale.
+            Reference: Touvron et al., "Going deeper with Image Transformers",
+            ICCV 2021 (CaiT).
     """
 
     def __init__(
@@ -290,6 +523,7 @@ class TauTrackFinderHead(nn.Module):
         num_decoder_layers: int = 4,
         dropout: float = 0.1,
         drop_path_rate: float = 0.0,
+        layer_scale_init: float = 1e-4,
     ):
         super().__init__()
         self.backbone_dim = backbone_dim
@@ -337,13 +571,14 @@ class TauTrackFinderHead(nn.Module):
 
         # ---- Dual Cross-Attention Decoder Layers ----
         # Each layer: self-attention -> compact cross-attention ->
-        # track cross-attention -> FFN. All post-norm.
+        # track cross-attention -> FFN. All post-norm with optional LayerScale.
         self.decoder_layers = nn.ModuleList([
             DualCrossAttentionDecoderLayer(
                 decoder_dim=decoder_dim,
                 num_heads=num_heads,
                 dim_feedforward=decoder_dim * 4,
                 dropout=dropout,
+                layer_scale_init=layer_scale_init,
             )
             for _ in range(num_decoder_layers)
         ])
