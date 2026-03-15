@@ -78,7 +78,11 @@ class TauTrackFinderHead(nn.Module):
             dropout=dropout,
             activation='gelu',
             batch_first=True,
-            norm_first=True,  # Pre-norm for training stability
+            norm_first=False,  # Post-norm (original DETR, Carion et al., ECCV 2020):
+            # Pre-norm caused encoded compact tokens to have cross-event cosine
+            # similarity ~0.97, meaning only ~3% of the representation is
+            # event-specific. Post-norm bounds token norms after each residual
+            # addition, preserving input-dependent variation across layers.
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
