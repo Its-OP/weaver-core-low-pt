@@ -44,9 +44,18 @@ class TauTrackFinder(nn.Module):
             Must include 'max_gt_tracks' (default: 6).
         mask_ce_loss_weight: Weight for cross-entropy mask loss (default: 2.0).
         confidence_loss_weight: Weight for confidence BCE (default: 2.0).
+        per_track_loss_weight: Weight for per-track focal BCE auxiliary loss
+            (default: 1.0). This OC-style loss provides direct binary
+            classification signal to every track (1130 gradients per event),
+            closing the 377× gradient density gap vs query-only training.
         no_object_weight: Weight for empty targets in confidence BCE
             (default: 0.4). Downweights the ~90% of queries that match
             no GT track.
+        focal_alpha: Alpha for per-track focal loss (default: 0.75).
+            Higher values weight positive (tau) tracks more, compensating
+            for ~3/1130 = 0.3% positive rate.
+        focal_gamma: Gamma for per-track focal loss modulation (default: 2.0).
+            Downweights easy examples where the model is already confident.
     """
 
     def __init__(
@@ -55,7 +64,10 @@ class TauTrackFinder(nn.Module):
         decoder_kwargs: dict | None = None,
         mask_ce_loss_weight: float = 2.0,
         confidence_loss_weight: float = 2.0,
+        per_track_loss_weight: float = 1.0,
         no_object_weight: float = 0.4,
+        focal_alpha: float = 0.75,
+        focal_gamma: float = 2.0,
     ):
         super().__init__()
 
@@ -66,7 +78,10 @@ class TauTrackFinder(nn.Module):
 
         self.mask_ce_loss_weight = mask_ce_loss_weight
         self.confidence_loss_weight = confidence_loss_weight
+        self.per_track_loss_weight = per_track_loss_weight
         self.no_object_weight = no_object_weight
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
 
         # Maximum number of GT tracks per event
         self.max_gt_tracks = decoder_kwargs.pop('max_gt_tracks', 6)
@@ -83,6 +98,72 @@ class TauTrackFinder(nn.Module):
 
         # Build decoder head
         self.head = TauTrackFinderHead(**decoder_kwargs)
+
+        # ---- Per-track classification head ----
+        # OC-style auxiliary head providing direct per-track supervision.
+        # Operates on frozen enriched features via Conv1d MLPs.
+        # Produces a per-track logit: sigmoid(logit) = P(tau pion | track).
+        # Trained with focal BCE on ALL ~1130 tracks, giving 377× more
+        # gradient signal than the 3 Hungarian-matched queries alone.
+        backbone_dim = self.backbone.output_dim
+        self.per_track_head = nn.Sequential(
+            nn.Conv1d(backbone_dim, 128, kernel_size=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Conv1d(128, 1, kernel_size=1),
+        )
+
+    def _focal_bce_loss(
+        self,
+        predicted_logits: torch.Tensor,
+        target_labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute focal binary cross-entropy loss over all valid tracks.
+
+        Focal loss (Lin et al., RetinaNet, ICCV 2017):
+            FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+        Focuses training on hard tracks by downweighting easy examples.
+        With ~3 positive out of ~1130 tracks, alpha=0.75 upweights positives.
+
+        Args:
+            predicted_logits: (B, P) per-track logits (pre-sigmoid).
+            target_labels: (B, P) binary labels (1.0 = tau track).
+            valid_mask: (B, P) boolean, True for valid tracks.
+
+        Returns:
+            Scalar focal BCE loss averaged over valid tracks.
+        """
+        # Standard per-element BCE (no reduction)
+        bce_per_track = functional.binary_cross_entropy_with_logits(
+            predicted_logits, target_labels, reduction='none',
+        )  # (B, P)
+
+        # p_t = P(correct class): p for positives, 1-p for negatives
+        predicted_probabilities = torch.sigmoid(predicted_logits)
+        probability_correct = torch.where(
+            target_labels == 1.0,
+            predicted_probabilities,
+            1.0 - predicted_probabilities,
+        )
+
+        # alpha_t: class balancing weight
+        alpha_weight = torch.where(
+            target_labels == 1.0,
+            self.focal_alpha,
+            1.0 - self.focal_alpha,
+        )
+
+        # FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+        # = alpha_t * (1 - p_t)^gamma * BCE
+        focal_weight = alpha_weight * ((1.0 - probability_correct) ** self.focal_gamma)
+        focal_loss_per_track = focal_weight * bce_per_track  # (B, P)
+
+        # Average over valid tracks only
+        focal_loss_per_track = focal_loss_per_track * valid_mask.float()
+        num_valid = valid_mask.float().sum().clamp(min=1.0)
+        return focal_loss_per_track.sum() / num_valid
 
     def _extract_ground_truth_indices(
         self,
@@ -250,8 +331,8 @@ class TauTrackFinder(nn.Module):
             track_labels: (B, 1, P) binary labels. Required for training.
 
         Returns:
-            Training: {'total_loss', 'mask_ce_loss', 'confidence_loss'}
-            Inference: {'mask_logits', 'confidence_logits'}
+            Training: {'total_loss', 'mask_ce_loss', 'confidence_loss', 'per_track_loss'}
+            Inference: {'mask_logits', 'confidence_logits', 'per_track_logits'}
         """
         # Backbone enrichment (frozen)
         with torch.no_grad():
@@ -260,10 +341,14 @@ class TauTrackFinder(nn.Module):
             )
         enriched_features = enriched_features.detach()
 
-        # Head forward — returns (mask_logits, confidence_logits)
+        # DETR decoder head — returns (mask_logits, confidence_logits)
         mask_logits, confidence_logits = self.head(
             enriched_features, mask, points,
         )
+
+        # Per-track classification head — direct per-track tau scores
+        # per_track_logits: (B, 1, P) → squeeze → (B, P)
+        per_track_logits = self.per_track_head(enriched_features).squeeze(1)
 
         # ---- Training ----
         if track_labels is not None:
@@ -271,24 +356,36 @@ class TauTrackFinder(nn.Module):
                 self._extract_ground_truth_indices(track_labels, mask)
             )
 
-            losses = self._compute_losses(
+            # DETR losses (query-based, Hungarian matching)
+            detr_losses = self._compute_losses(
                 mask_logits, confidence_logits,
                 ground_truth_indices, ground_truth_count,
             )
 
+            # Per-track focal BCE loss (OC-style, all 1130 tracks)
+            # Provides 377× more gradient signal than query-only training.
+            labels_flat = track_labels.squeeze(1) * mask.squeeze(1).float()
+            valid_mask = mask.squeeze(1).bool()
+            per_track_loss = self._focal_bce_loss(
+                per_track_logits, labels_flat, valid_mask,
+            )
+
             total_loss = (
-                self.mask_ce_loss_weight * losses['mask_ce_loss']
-                + self.confidence_loss_weight * losses['confidence_loss']
+                self.mask_ce_loss_weight * detr_losses['mask_ce_loss']
+                + self.confidence_loss_weight * detr_losses['confidence_loss']
+                + self.per_track_loss_weight * per_track_loss
             )
 
             return {
                 'total_loss': total_loss,
-                'mask_ce_loss': losses['mask_ce_loss'],
-                'confidence_loss': losses['confidence_loss'],
+                'mask_ce_loss': detr_losses['mask_ce_loss'],
+                'confidence_loss': detr_losses['confidence_loss'],
+                'per_track_loss': per_track_loss,
             }
 
         # ---- Inference ----
         return {
             'mask_logits': mask_logits,
             'confidence_logits': confidence_logits,
+            'per_track_logits': per_track_logits,
         }
