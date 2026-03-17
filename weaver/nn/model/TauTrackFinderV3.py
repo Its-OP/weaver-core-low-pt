@@ -43,6 +43,7 @@ import torch.nn.functional as functional
 
 from weaver.nn.model.EnrichCompactBackbone import EnrichCompactBackbone
 from weaver.nn.model.HierarchicalGraphBackbone import cross_set_knn, cross_set_gather
+from weaver.nn.model.ParallelBackbone import ParallelBackbone
 
 
 class GAPLayer(nn.Module):
@@ -292,7 +293,11 @@ class TauTrackFinderV3(nn.Module):
     particles in the receptive window originate from different sources).
 
     Args:
-        backbone_kwargs: Config for EnrichCompactBackbone.
+        backbone_mode: Which backbone to use. Options:
+            'frozen' — Frozen pretrained EnrichCompactBackbone (default, V3 original).
+            'parallel' — Trainable ParallelBackbone (identity + context streams).
+        backbone_kwargs: Config for EnrichCompactBackbone (used when backbone_mode='frozen').
+        parallel_backbone_kwargs: Config for ParallelBackbone (used when backbone_mode='parallel').
         gap1_encoding_dim: Encoding dimension for first GAPLayer.
         gap1_num_neighbors: kNN K for first GAPLayer (physical space).
         gap1_num_heads: Number of attention heads for first GAPLayer.
@@ -308,7 +313,9 @@ class TauTrackFinderV3(nn.Module):
 
     def __init__(
         self,
+        backbone_mode: str = 'frozen',
         backbone_kwargs: dict | None = None,
+        parallel_backbone_kwargs: dict | None = None,
         gap1_encoding_dim: int = 64,
         gap1_num_neighbors: int = 16,
         gap1_num_heads: int = 4,
@@ -325,17 +332,26 @@ class TauTrackFinderV3(nn.Module):
 
         if backbone_kwargs is None:
             backbone_kwargs = {}
+        if parallel_backbone_kwargs is None:
+            parallel_backbone_kwargs = {}
 
+        self.backbone_mode = backbone_mode
         self.gap1_num_neighbors = gap1_num_neighbors
         self.gap2_num_neighbors = gap2_num_neighbors
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
 
-        # ---- Backbone (frozen) ----
-        self.backbone = EnrichCompactBackbone(**backbone_kwargs)
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad = False
-        backbone_dim = self.backbone.enrichment_output_dim  # typically 256
+        # ---- Backbone ----
+        if backbone_mode == 'parallel':
+            # Trainable parallel identity + context backbone
+            self.backbone = ParallelBackbone(**parallel_backbone_kwargs)
+            backbone_dim = self.backbone.output_dim
+        else:
+            # Frozen pretrained EnrichCompactBackbone (default)
+            self.backbone = EnrichCompactBackbone(**backbone_kwargs)
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad = False
+            backbone_dim = self.backbone.enrichment_output_dim  # typically 256
 
         # ---- GAPLayer 1: kNN in physical (eta, phi) space ----
         self.gap_layer_physical = GAPLayer(
@@ -612,12 +628,19 @@ class TauTrackFinderV3(nn.Module):
         mask_float = mask.float()
         valid_mask = mask.squeeze(1).bool()  # (B, P)
 
-        # ---- Step 1: Backbone enrichment (frozen) ----
-        with torch.no_grad():
-            enriched_features = self.backbone.enrich(
+        # ---- Step 1: Backbone feature extraction ----
+        if self.backbone_mode == 'parallel':
+            # Trainable parallel backbone: identity + context streams
+            enriched_features = self.backbone(
                 points, features, lorentz_vectors, mask,
-            )
-        enriched_features = enriched_features.detach()  # (B, backbone_dim, P)
+            )  # (B, backbone_dim, P)
+        else:
+            # Frozen pretrained backbone enrichment
+            with torch.no_grad():
+                enriched_features = self.backbone.enrich(
+                    points, features, lorentz_vectors, mask,
+                )
+            enriched_features = enriched_features.detach()  # (B, backbone_dim, P)
 
         # ---- Step 2: GAPLayer 1 in physical (eta, phi) space ----
         physical_knn_indices = self._compute_physical_knn(points, mask)
