@@ -74,6 +74,13 @@ class GAPLayer(nn.Module):
         encoding_dim: Output dimension of each head (F in ABCNet).
         num_neighbors: Number of kNN neighbors (K).
         num_heads: Number of parallel attention heads (H).
+            Ignored when use_mia=True (MIA uses encoding_dim heads internally).
+        use_mia: If True, use More-Interaction Attention (MIParT, Wu & Wang 2024).
+            MIA replaces Q/K-based attention with high-dimensional pairwise
+            embeddings: each of encoding_dim channels acts as an independent
+            attention head (head_dim=1), element-wise scaling edge features.
+            Only a Value projection is learned per layer; attention pattern is
+            purely determined by pairwise geometry.
     """
 
     def __init__(
@@ -82,44 +89,152 @@ class GAPLayer(nn.Module):
         encoding_dim: int,
         num_neighbors: int,
         num_heads: int = 1,
+        use_mia: bool = False,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.encoding_dim = encoding_dim
         self.num_neighbors = num_neighbors
         self.num_heads = num_heads
+        self.use_mia = use_mia
 
-        # Per-head parameter modules
-        self.node_encoders = nn.ModuleList()
-        self.edge_encoders = nn.ModuleList()
-        self.self_attention_scorers = nn.ModuleList()
-        self.neighbor_attention_scorers = nn.ModuleList()
-
-        for _ in range(num_heads):
-            # Node encoder: x_i -> x'_i of dimension encoding_dim
-            # Conv1d operates on (B, C_in, P) -> (B, encoding_dim, P)
-            self.node_encoders.append(nn.Sequential(
-                nn.Conv1d(input_dim, encoding_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(encoding_dim),
-            ))
-
-            # Edge encoder: y_ij -> y'_ij of dimension encoding_dim
-            # Conv2d operates on (B, C_in, P, K) -> (B, encoding_dim, P, K)
-            self.edge_encoders.append(nn.Sequential(
+        if use_mia:
+            # ---- MIA mode (More-Interaction Attention) ----
+            # Edge features → encoding_dim-channel attention weights via MLP.
+            # Each channel = 1 attention head with head_dim=1.
+            # No Q/K projections — attention purely from pairwise geometry.
+            # Only a Value projection is learned.
+            #
+            # MIA attention: softmax_j(MLP(y_ij)) ∈ (B, encoding_dim, P, K)
+            # Output: sum_j attention_ij * value_j
+            self.mia_edge_embed = nn.Sequential(
                 nn.Conv2d(input_dim, encoding_dim, kernel_size=1, bias=True),
                 nn.BatchNorm2d(encoding_dim),
-            ))
-
-            # Self-attention scorer: x'_i -> scalar
-            # Broadcasts over K dimension via unsqueeze
-            self.self_attention_scorers.append(
-                nn.Conv1d(encoding_dim, 1, kernel_size=1, bias=True),
+                nn.LeakyReLU(negative_slope=0.2),
+                nn.Conv2d(encoding_dim, encoding_dim, kernel_size=1, bias=True),
+                nn.BatchNorm2d(encoding_dim),
             )
 
-            # Neighbor attention scorer: y'_ij -> scalar
-            self.neighbor_attention_scorers.append(
-                nn.Conv2d(encoding_dim, 1, kernel_size=1, bias=True),
+            # Value projection: input features → encoding_dim values
+            self.mia_value_projection = nn.Sequential(
+                nn.Conv1d(input_dim, encoding_dim, kernel_size=1, bias=False),
+                nn.BatchNorm1d(encoding_dim),
             )
+        else:
+            # ---- Standard ABCNet-style attention ----
+            # Per-head parameter modules
+            self.node_encoders = nn.ModuleList()
+            self.edge_encoders = nn.ModuleList()
+            self.self_attention_scorers = nn.ModuleList()
+            self.neighbor_attention_scorers = nn.ModuleList()
+
+            for _ in range(num_heads):
+                # Node encoder: x_i -> x'_i of dimension encoding_dim
+                self.node_encoders.append(nn.Sequential(
+                    nn.Conv1d(input_dim, encoding_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm1d(encoding_dim),
+                ))
+
+                # Edge encoder: y_ij -> y'_ij of dimension encoding_dim
+                self.edge_encoders.append(nn.Sequential(
+                    nn.Conv2d(input_dim, encoding_dim, kernel_size=1, bias=True),
+                    nn.BatchNorm2d(encoding_dim),
+                ))
+
+                # Self-attention scorer: x'_i -> scalar
+                self.self_attention_scorers.append(
+                    nn.Conv1d(encoding_dim, 1, kernel_size=1, bias=True),
+                )
+
+                # Neighbor attention scorer: y'_ij -> scalar
+                self.neighbor_attention_scorers.append(
+                    nn.Conv2d(encoding_dim, 1, kernel_size=1, bias=True),
+                )
+
+    def compute_mia_attention_weights(
+        self,
+        features: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute MIA high-dimensional attention weights.
+
+        Returns (B, encoding_dim, P, K) softmax attention weights where
+        each of encoding_dim channels is an independent attention head.
+        """
+        # Gather neighbor features and compute edge features
+        neighbor_features = cross_set_gather(features, neighbor_indices)
+        center_expanded = features.unsqueeze(-1).expand_as(neighbor_features)
+        edge_features = neighbor_features - center_expanded  # (B, input_dim, P, K)
+
+        # MLP → (B, encoding_dim, P, K) attention logits
+        attention_logits = self.mia_edge_embed(edge_features)
+
+        # Mask invalid neighbors
+        neighbor_validity = cross_set_gather(
+            mask.float(), neighbor_indices,
+        )  # (B, 1, P, K)
+        attention_logits = attention_logits.masked_fill(
+            neighbor_validity == 0, float('-inf'),
+        )
+
+        # Softmax over K independently per channel
+        attention_weights = functional.softmax(attention_logits, dim=-1)
+        attention_weights = attention_weights.nan_to_num(0.0)
+
+        return attention_weights
+
+    def _forward_mia(
+        self,
+        features: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MIA forward: high-dimensional attention-weighted aggregation.
+
+        Attention pattern determined purely by pairwise edge geometry.
+        Only Value projection is learned per layer.
+
+        output_i = sum_j softmax_j(MLP(f_j - f_i))[c] * V(f_j)[c]
+        for each channel c independently (encoding_dim heads, head_dim=1).
+        """
+        # Attention weights from edge geometry: (B, encoding_dim, P, K)
+        attention_weights = self.compute_mia_attention_weights(
+            features, neighbor_indices, mask,
+        )
+
+        # Value projection: (B, input_dim, P) → (B, encoding_dim, P)
+        values = self.mia_value_projection(features)
+
+        # Gather neighbor values: (B, encoding_dim, P, K)
+        neighbor_values = cross_set_gather(values, neighbor_indices)
+
+        # Attention-weighted aggregation (element-wise per channel)
+        # attention_weights: (B, encoding_dim, P, K)
+        # neighbor_values: (B, encoding_dim, P, K)
+        attention_output = (attention_weights * neighbor_values).sum(dim=-1)
+        attention_output = functional.relu(attention_output)  # (B, encoding_dim, P)
+
+        # Graph features: max-pool over encoded edges (same as standard mode)
+        neighbor_features = cross_set_gather(features, neighbor_indices)
+        center_expanded = features.unsqueeze(-1).expand_as(neighbor_features)
+        edge_features = neighbor_features - center_expanded
+        encoded_edges = self.mia_edge_embed(edge_features)  # Reuse MIA embed
+        neighbor_validity = cross_set_gather(mask.float(), neighbor_indices)
+        encoded_edges = encoded_edges.masked_fill(
+            neighbor_validity == 0, float('-inf'),
+        )
+        graph_features = encoded_edges.max(dim=-1)[0]
+        graph_features = graph_features.masked_fill(
+            graph_features == float('-inf'), 0.0,
+        )
+
+        # Zero padded
+        mask_float = mask.float()
+        attention_output = attention_output * mask_float
+        graph_features = graph_features * mask_float
+
+        return attention_output, graph_features
 
     def compute_attention_coefficients(
         self,
@@ -235,17 +350,20 @@ class GAPLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass: multi-head attention-weighted edge convolution.
 
+        Dispatches to MIA mode or standard ABCNet mode based on use_mia flag.
+
         Args:
             features: (B, input_dim, P) per-track features.
             neighbor_indices: (B, P, K) kNN indices.
             mask: (B, 1, P) boolean mask, True for valid tracks.
 
         Returns:
-            attention_features: (B, encoding_dim, P) — max across heads of
-                attention-weighted outputs.
-            graph_features: (B, encoding_dim, P) — max across heads of
-                max-pooled edge features.
+            attention_features: (B, encoding_dim, P)
+            graph_features: (B, encoding_dim, P)
         """
+        if self.use_mia:
+            return self._forward_mia(features, neighbor_indices, mask)
+
         head_attention_outputs = []
         head_graph_features = []
 
@@ -370,6 +488,7 @@ class TauTrackFinderV3(nn.Module):
             encoding_dim=gap1_encoding_dim,
             num_neighbors=gap1_num_neighbors,
             num_heads=gap1_num_heads,
+            use_mia=True,
         )
 
         # Intermediate MLPs after GAPLayer 1
@@ -395,6 +514,7 @@ class TauTrackFinderV3(nn.Module):
             encoding_dim=gap2_encoding_dim,
             num_neighbors=gap2_num_neighbors,
             num_heads=gap2_num_heads,
+            use_mia=True,
         )
 
         # Intermediate MLPs after GAPLayer 2
