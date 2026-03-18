@@ -36,6 +36,8 @@ class TrackPreFilter(nn.Module):
         use_lorentz_vectors: If True, include raw 4-vectors as additional input.
         num_message_rounds: Number of kNN aggregation rounds (default: 1).
         use_gap_attention: If True, use GAPLayer MIA instead of max-pool.
+        use_triplet_scoring: If True, apply TripletScorer after per-track scoring.
+        triplet_kwargs: Config dict for TripletScorer (num_anchors, num_neighbors, etc.).
     """
 
     def __init__(
@@ -51,6 +53,8 @@ class TrackPreFilter(nn.Module):
         use_lorentz_vectors: bool = False,
         num_message_rounds: int = 1,
         use_gap_attention: bool = False,
+        use_triplet_scoring: bool = False,
+        triplet_kwargs: dict | None = None,
     ):
         super().__init__()
         self.mode = mode
@@ -61,6 +65,11 @@ class TrackPreFilter(nn.Module):
         self.use_lorentz_vectors = use_lorentz_vectors
         self.num_message_rounds = num_message_rounds
         self.use_gap_attention = use_gap_attention
+        self.use_triplet_scoring = use_triplet_scoring
+
+        if use_triplet_scoring:
+            from weaver.nn.model.TripletScorer import TripletScorer
+            self.triplet_scorer = TripletScorer(**(triplet_kwargs or {}))
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
@@ -232,6 +241,17 @@ class TrackPreFilter(nn.Module):
 
         # Padded tracks get -inf so they never appear in top-K
         scores = scores.masked_fill(~valid_mask, float('-inf'))
+
+        # Triplet scoring: enumerate triplets, score them, boost per-track scores
+        if self.use_triplet_scoring and hasattr(self, 'triplet_scorer'):
+            triplet_indices, triplet_features = self.triplet_scorer.enumerate_triplets(
+                scores, points, features, lorentz_vectors, mask,
+            )
+            if triplet_indices is not None:
+                triplet_scores = self.triplet_scorer.score_triplets(triplet_features)
+                scores = self.triplet_scorer.propagate_boost(
+                    scores, triplet_indices, triplet_scores,
+                )
 
         return scores
 
