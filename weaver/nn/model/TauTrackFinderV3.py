@@ -711,6 +711,8 @@ class TauTrackFinderV3(nn.Module):
         Returns:
             Scalar ASL loss averaged over valid tracks.
         """
+        # Clamp logits to avoid NaN from BCE on extreme values (padded tracks)
+        predicted_logits = predicted_logits.clamp(min=-50.0, max=50.0)
         predicted_probabilities = torch.sigmoid(predicted_logits)
 
         # ---- Positive loss: -(1-p)^γ+ * log(p) ----
