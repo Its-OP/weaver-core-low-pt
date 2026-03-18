@@ -1,10 +1,11 @@
 """Stage 1 pre-filter for two-stage track finding pipeline.
 
 Scores each track and selects top-K candidates for downstream processing.
-Three modes:
+Modes:
     A. MLP + neighborhood context (kNN max-pool + per-track MLP)
     B. Two-tower with learned tau prototype (cosine similarity)
     C. Autoencoder anomaly scorer (reconstruction error)
+    D. Hybrid: autoencoder features fed into MLP scorer
 
 All modes produce per-track scores (B, P) and support top-K selection
 that repacks tensors for Stage 2.
@@ -32,11 +33,6 @@ class TrackPreFilter(nn.Module):
         num_neighbors: kNN K for MLP neighborhood mode (default: 16).
         num_prototypes: Number of learned tau prototypes for two-tower (default: 1).
         ranking_num_samples: Negatives sampled per positive in ranking loss.
-        use_asl: If True, add ASL loss alongside ranking loss.
-        asl_gamma_positive: ASL gamma for positives (default: 1.0).
-        asl_gamma_negative: ASL gamma for negatives (default: 4.0).
-        asl_clip: ASL hard probability-shift threshold (default: 0.05).
-        asl_weight: Weight for ASL relative to ranking loss (default: 1.0).
         use_lorentz_vectors: If True, include raw 4-vectors as additional input.
         num_message_rounds: Number of kNN aggregation rounds (default: 1).
         use_gap_attention: If True, use GAPLayer MIA instead of max-pool.
@@ -52,11 +48,6 @@ class TrackPreFilter(nn.Module):
         num_neighbors: int = 16,
         num_prototypes: int = 1,
         ranking_num_samples: int = 20,
-        use_asl: bool = False,
-        asl_gamma_positive: float = 1.0,
-        asl_gamma_negative: float = 4.0,
-        asl_clip: float = 0.05,
-        asl_weight: float = 1.0,
         use_lorentz_vectors: bool = False,
         num_message_rounds: int = 1,
         use_gap_attention: bool = False,
@@ -69,19 +60,10 @@ class TrackPreFilter(nn.Module):
         self.num_neighbors = num_neighbors
         self.num_prototypes = num_prototypes
         self.ranking_num_samples = ranking_num_samples
-        self.use_asl = use_asl
-        self.asl_gamma_positive = asl_gamma_positive
-        self.asl_gamma_negative = asl_gamma_negative
-        self.asl_clip = asl_clip
-        self.asl_weight = asl_weight
         self.use_lorentz_vectors = use_lorentz_vectors
         self.num_message_rounds = num_message_rounds
         self.use_gap_attention = use_gap_attention
         self.use_pairwise_physics = use_pairwise_physics
-
-        # Score propagation parameters (inference-time post-processing)
-        self.score_propagation_alpha = 0.3
-        self.score_propagation_iterations = 3
 
         # Pairwise physics feature encoder
         # 5 raw pairwise features: invariant_mass, delta_R, ln_kT, ln_z, charge_product
@@ -235,7 +217,6 @@ class TrackPreFilter(nn.Module):
         features: torch.Tensor,
         lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
-        use_score_propagation: bool = False,
     ) -> torch.Tensor:
         """Compute per-track scores.
 
@@ -244,8 +225,6 @@ class TrackPreFilter(nn.Module):
             features: (B, input_dim, P) raw per-track features.
             lorentz_vectors: (B, 4, P) raw 4-vectors.
             mask: (B, 1, P) boolean mask.
-            use_score_propagation: If True, apply graph score propagation
-                as post-processing (inference only, no extra training needed).
 
         Returns:
             scores: (B, P) per-track scores. Padded tracks get -inf.
@@ -267,10 +246,6 @@ class TrackPreFilter(nn.Module):
 
         # Padded tracks get -inf so they never appear in top-K
         scores = scores.masked_fill(~valid_mask, float('-inf'))
-
-        # Optional: propagate scores through kNN graph (inference only)
-        if use_score_propagation and not self.training:
-            scores = self._propagate_scores(scores, points, mask)
 
         return scores
 
@@ -610,48 +585,6 @@ class TrackPreFilter(nn.Module):
             return total_loss
         return total_loss / num_events_with_gt
 
-    def _asl_loss(
-        self,
-        scores: torch.Tensor,
-        labels: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Asymmetric Loss (Ben-Baruch et al., ICCV 2021).
-
-        Different focusing for positives vs negatives, plus hard clip
-        that zeros easy negative gradients entirely.
-        """
-        # Clamp scores to avoid NaN from BCE on -inf (padded tracks)
-        scores = scores.clamp(min=-50.0, max=50.0)
-        predicted_probabilities = torch.sigmoid(scores)
-
-        # Positive loss: -(1-p)^γ+ * log(p)
-        positive_bce = functional.binary_cross_entropy_with_logits(
-            scores, torch.ones_like(scores), reduction='none',
-        )
-        positive_weight = (
-            (1.0 - predicted_probabilities) ** self.asl_gamma_positive
-        )
-        positive_loss = positive_weight * positive_bce
-
-        # Negative loss: -max(p-m, 0)^γ- * log(1-p)
-        shifted_probability = (
-            predicted_probabilities - self.asl_clip
-        ).clamp(min=0.0)
-        negative_bce = functional.binary_cross_entropy_with_logits(
-            scores, torch.zeros_like(scores), reduction='none',
-        )
-        negative_weight = shifted_probability ** self.asl_gamma_negative
-        negative_loss = negative_weight * negative_bce
-
-        loss_per_track = torch.where(
-            labels == 1.0, positive_loss, negative_loss,
-        )
-        valid_float = valid_mask.float()
-        loss_per_track = loss_per_track * valid_float
-        num_valid = valid_float.sum().clamp(min=1.0)
-        return loss_per_track.sum() / num_valid
-
     def _create_denoising_copies(
         self,
         features: torch.Tensor,
@@ -741,12 +674,6 @@ class TrackPreFilter(nn.Module):
         loss_dict = {
             'ranking_loss': ranking_loss,
         }
-
-        # ASL loss component
-        if self.use_asl:
-            asl_loss = self._asl_loss(scores, labels_flat, valid_mask)
-            total_loss = total_loss + self.asl_weight * asl_loss
-            loss_dict['asl_loss'] = asl_loss
 
         # Contrastive denoising: run forward on feature-noised GT copies
         if use_contrastive_denoising and self.training:
@@ -876,66 +803,6 @@ class TrackPreFilter(nn.Module):
         if num_events == 0:
             return total_loss
         return total_loss / num_events
-
-    def _propagate_scores(
-        self,
-        scores: torch.Tensor,
-        points: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Post-processing: propagate scores through kNN graph.
-
-        Smooths scores so that neighbors of high-scoring tracks get
-        boosted. Uses iterative averaging:
-            s = alpha * A_norm @ s + (1 - alpha) * s_original
-
-        Validated: GT pions have 8.9x more GT neighbors than background
-        (0.32 vs 0.04 GT neighbors in k=16), so propagation helps ~28%
-        of GT pions that have at least 1 GT neighbor.
-
-        Args:
-            scores: (B, P) per-track scores.
-            points: (B, 2, P) coordinates for kNN.
-            mask: (B, 1, P) boolean mask.
-
-        Returns:
-            smoothed_scores: (B, P) propagated scores.
-        """
-        alpha = self.score_propagation_alpha
-        original_scores = scores.clone()
-        valid_mask = mask.squeeze(1).bool()
-
-        with torch.no_grad():
-            neighbor_indices = cross_set_knn(
-                query_coordinates=points,
-                reference_coordinates=points,
-                num_neighbors=self.num_neighbors,
-                reference_mask=mask,
-                query_reference_indices=None,
-            )  # (B, P, K)
-
-        for _ in range(self.score_propagation_iterations):
-            # Gather neighbor scores: (B, P, K)
-            neighbor_scores = scores.unsqueeze(1)  # (B, 1, P)
-            neighbor_scores = cross_set_gather(
-                neighbor_scores, neighbor_indices,
-            ).squeeze(1)  # (B, P, K)
-
-            # Mask invalid neighbors
-            neighbor_validity = cross_set_gather(
-                mask.float(), neighbor_indices,
-            ).squeeze(1)  # (B, P, K)
-            neighbor_scores = neighbor_scores * neighbor_validity
-
-            # Average neighbor scores
-            num_valid_neighbors = neighbor_validity.sum(dim=-1).clamp(min=1.0)
-            mean_neighbor_score = neighbor_scores.sum(dim=-1) / num_valid_neighbors
-
-            # Smooth: blend with original
-            scores = alpha * mean_neighbor_score + (1 - alpha) * original_scores
-            scores = scores.masked_fill(~valid_mask, float('-inf'))
-
-        return scores
 
     def select_top_k(
         self,
