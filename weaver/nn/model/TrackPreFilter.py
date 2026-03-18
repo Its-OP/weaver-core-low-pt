@@ -51,8 +51,6 @@ class TrackPreFilter(nn.Module):
         use_lorentz_vectors: bool = False,
         num_message_rounds: int = 1,
         use_gap_attention: bool = False,
-        use_pairwise_physics: bool = False,
-        pairwise_edge_dim: int = 16,
     ):
         super().__init__()
         self.mode = mode
@@ -63,22 +61,6 @@ class TrackPreFilter(nn.Module):
         self.use_lorentz_vectors = use_lorentz_vectors
         self.num_message_rounds = num_message_rounds
         self.use_gap_attention = use_gap_attention
-        self.use_pairwise_physics = use_pairwise_physics
-
-        # Pairwise physics → attention bias (NOT direct feature input)
-        # 5 raw pairwise features → scalar attention bias per neighbor
-        # Pairwise features modulate WHICH neighbors matter (routing),
-        # but never enter the value stream (prevents modality dominance)
-        if use_pairwise_physics:
-            num_pairwise_raw = 5
-            self.pairwise_encoder = nn.Sequential(
-                nn.Conv2d(num_pairwise_raw, pairwise_edge_dim, kernel_size=1, bias=False),
-                nn.BatchNorm2d(pairwise_edge_dim),
-                nn.ReLU(),
-                nn.Conv2d(pairwise_edge_dim, 1, kernel_size=1, bias=True),
-            )
-        # Initial residual weight (preserves raw per-track features through message passing)
-        self.residual_alpha = 0.3
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
@@ -197,8 +179,6 @@ class TrackPreFilter(nn.Module):
                     for _ in range(num_message_rounds)
                 ])
             else:
-                # Input: cat(track, aggregated_neighbor) — pairwise features
-                # are now used as attention bias, not concatenated
                 neighbor_input_dim = 2 * hidden_dim
                 self.neighbor_mlps = nn.ModuleList([
                     nn.Sequential(
@@ -353,91 +333,6 @@ class TrackPreFilter(nn.Module):
         scores = -reconstruction_error
         return scores
 
-    def _compute_pairwise_physics_features(
-        self,
-        lorentz_vectors: torch.Tensor,
-        features: torch.Tensor,
-        neighbor_indices: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute physics-informed pairwise features for kNN edges.
-
-        For each (track_i, neighbor_j) pair, computes:
-            0: invariant mass m_ij = sqrt((E_i+E_j)^2 - |p_i+p_j|^2)
-            1: delta_R in (eta, phi)
-            2: ln(kT) = ln(min(pT_i, pT_j) * delta_R)
-            3: ln(z) = ln(min(pT_i, pT_j) / (pT_i + pT_j))
-            4: charge_product = charge_i * charge_j
-
-        Args:
-            lorentz_vectors: (B, 4, P) raw [px, py, pz, E].
-            features: (B, input_dim, P) — charge at index 5.
-            neighbor_indices: (B, P, K) kNN indices.
-            mask: (B, 1, P) boolean mask.
-
-        Returns:
-            encoded_pairwise: (B, pairwise_edge_dim, P, K) encoded features.
-        """
-        with torch.no_grad():
-            # Gather neighbor 4-vectors: (B, 4, P, K)
-            neighbor_lv = cross_set_gather(lorentz_vectors.float(), neighbor_indices)
-            center_lv = lorentz_vectors.float().unsqueeze(-1).expand_as(neighbor_lv)
-
-            px_i, py_i, pz_i, e_i = center_lv[:, 0], center_lv[:, 1], center_lv[:, 2], center_lv[:, 3]
-            px_j, py_j, pz_j, e_j = neighbor_lv[:, 0], neighbor_lv[:, 1], neighbor_lv[:, 2], neighbor_lv[:, 3]
-
-            # Invariant mass: m_ij = sqrt((E_i+E_j)^2 - |p_i+p_j|^2)
-            sum_e = e_i + e_j
-            sum_px = px_i + px_j
-            sum_py = py_i + py_j
-            sum_pz = pz_i + pz_j
-            m2 = sum_e.square() - sum_px.square() - sum_py.square() - sum_pz.square()
-            inv_mass = torch.sqrt(m2.clamp(min=1e-8))  # (B, P, K)
-
-            # pT for each track
-            pt_i = torch.sqrt(px_i.square() + py_i.square() + 1e-8)
-            pt_j = torch.sqrt(px_j.square() + py_j.square() + 1e-8)
-
-            # delta_R from eta, phi
-            # eta = arctanh(pz/|p|), but simpler: use track eta/phi from features
-            # Actually compute from 4-vectors for consistency
-            p_i = torch.sqrt(px_i.square() + py_i.square() + pz_i.square() + 1e-8)
-            p_j = torch.sqrt(px_j.square() + py_j.square() + pz_j.square() + 1e-8)
-            eta_i = 0.5 * torch.log((p_i + pz_i + 1e-8) / (p_i - pz_i + 1e-8))
-            eta_j = 0.5 * torch.log((p_j + pz_j + 1e-8) / (p_j - pz_j + 1e-8))
-            phi_i = torch.atan2(py_i, px_i)
-            phi_j = torch.atan2(py_j, px_j)
-            d_eta = eta_i - eta_j
-            d_phi = (phi_i - phi_j + 3.14159) % (2 * 3.14159) - 3.14159
-            delta_r = torch.sqrt(d_eta.square() + d_phi.square() + 1e-8)
-
-            # ln(kT) and ln(z)
-            min_pt = torch.min(pt_i, pt_j)
-            sum_pt = pt_i + pt_j
-            ln_kt = torch.log(min_pt * delta_r + 1e-8)
-            ln_z = torch.log(min_pt / (sum_pt + 1e-8) + 1e-8)
-
-            # Charge product: features[:, 5, :] = charge per track
-            charge_per_track = features[:, 5:6, :]  # (B, 1, P)
-            center_charge = charge_per_track.unsqueeze(-1).expand(
-                -1, -1, inv_mass.shape[1], inv_mass.shape[2],
-            )  # (B, 1, P, K)
-            neighbor_charge = cross_set_gather(
-                charge_per_track, neighbor_indices,
-            )  # (B, 1, P, K)
-            charge_product = (center_charge * neighbor_charge).squeeze(1)  # (B, P, K)
-
-        # Stack raw pairwise features: (B, 5, P, K)
-        raw_pairwise = torch.stack([
-            inv_mass, delta_r, ln_kt, ln_z, charge_product,
-        ], dim=1).to(lorentz_vectors.dtype)
-
-        # Mask invalid edges
-        neighbor_validity = cross_set_gather(mask.float(), neighbor_indices)
-        raw_pairwise = raw_pairwise * neighbor_validity
-
-        return raw_pairwise  # (B, 5, P, K) — encoding done by caller
-
     def _forward_hybrid(
         self,
         points: torch.Tensor,
@@ -504,52 +399,19 @@ class TrackPreFilter(nn.Module):
                     mask.float(), neighbor_indices,
                 )
 
-                if self.use_pairwise_physics and hasattr(self, 'pairwise_encoder'):
-                    # Pairwise features as ATTENTION BIAS (not direct input)
-                    # Modulates which neighbors matter without injecting
-                    # pairwise information into the value stream
-                    if round_index == 0:
-                        raw_pairwise = self._compute_pairwise_physics_features(
-                            self._lorentz_cache if hasattr(self, '_lorentz_cache') else torch.zeros_like(mask).expand(-1, 4, -1),
-                            features, neighbor_indices, mask,
-                        )  # (B, 5, P, K) raw features
-                        # Encode to scalar attention bias: (B, 1, P, K)
-                        self._cached_attention_bias = self.pairwise_encoder(
-                            raw_pairwise,
-                        )
-                    # Attention-weighted aggregation
-                    attention_logits = self._cached_attention_bias.clone()
-                    attention_logits = attention_logits.masked_fill(
-                        neighbor_validity == 0, float('-inf'),
-                    )
-                    attention_weights = functional.softmax(
-                        attention_logits, dim=-1,
-                    )  # (B, 1, P, K)
-                    attention_weights = attention_weights.nan_to_num(0.0)
-                    # Weighted sum of neighbor features (pairwise only routes)
-                    weighted_neighbors = (
-                        attention_weights * neighbor_features
-                    ).sum(dim=-1)  # (B, hidden_dim, P)
-                    aggregated = torch.cat(
-                        [current, weighted_neighbors], dim=1,
-                    )
-                else:
-                    # Standard max-pool aggregation
-                    neighbor_features = neighbor_features.masked_fill(
-                        neighbor_validity == 0, float('-inf'),
-                    )
-                    max_pooled = neighbor_features.max(dim=-1)[0]
-                    max_pooled = max_pooled.masked_fill(
-                        max_pooled == float('-inf'), 0.0,
-                    )
-                    aggregated = torch.cat(
-                        [current, max_pooled], dim=1,
-                    )
+                # Standard max-pool aggregation
+                neighbor_features = neighbor_features.masked_fill(
+                    neighbor_validity == 0, float('-inf'),
+                )
+                max_pooled = neighbor_features.max(dim=-1)[0]
+                max_pooled = max_pooled.masked_fill(
+                    max_pooled == float('-inf'), 0.0,
+                )
+                aggregated = torch.cat(
+                    [current, max_pooled], dim=1,
+                )
 
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
-
-        # Fix 1: Initial residual — guarantees raw per-track features survive
-        current = current + self.residual_alpha * track_embedding
 
         scores = self.scorer(current).squeeze(1)
         return scores
