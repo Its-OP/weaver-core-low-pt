@@ -57,6 +57,9 @@ class TrackPreFilter(nn.Module):
         ranking_temperature_end: float = 1.0,
         drw_warmup_fraction: float = 1.0,
         drw_positive_weight: float = 1.0,
+        aggregation_mode: str = 'max',
+        focal_gamma: float = 0.0,
+        contrastive_denoising_negative_sigma: float = 0.0,
     ):
         super().__init__()
         self.mode = mode
@@ -85,6 +88,20 @@ class TrackPreFilter(nn.Module):
         self.drw_positive_weight = drw_positive_weight
         self._drw_active: bool = False
 
+        # PNA multi-aggregation (Corso et al., NeurIPS 2020):
+        # 'max' = standard max-pool, 'pna' = cat([mean, max, min, std])
+        self.aggregation_mode = aggregation_mode
+
+        # Equalized focal weighting (Li et al., CVPR 2022):
+        # 0.0 = disabled, >0 = smooth (1-p)^γ modulation on pairwise loss.
+        # Unlike ASL (which zeroed gradients), focal never zeros any gradient.
+        self.focal_gamma = focal_gamma
+
+        # DINO-style contrastive denoising (Zhang et al., ICLR 2023):
+        # 0.0 = disabled (positive copies only, current behavior).
+        # >0 = also create negative copies with this sigma, must be rejected.
+        self.contrastive_denoising_negative_sigma = contrastive_denoising_negative_sigma
+
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
             self.lorentz_norm = nn.BatchNorm1d(4)
@@ -107,8 +124,12 @@ class TrackPreFilter(nn.Module):
                 nn.ReLU(),
             )
             # Neighbor aggregation — repeated for each message round
-            # cat([current, max_pooled]) = 2 * hidden_dim → hidden_dim
-            neighbor_input_dim = 2 * hidden_dim
+            if aggregation_mode == 'pna':
+                # PNA: cat([current, mean, max, min, std]) = 5 * hidden_dim
+                neighbor_input_dim = 5 * hidden_dim
+            else:
+                # Standard: cat([current, max_pooled]) = 2 * hidden_dim
+                neighbor_input_dim = 2 * hidden_dim
             self.neighbor_mlps = nn.ModuleList([
                 nn.Sequential(
                     nn.Conv1d(neighbor_input_dim, hidden_dim, kernel_size=1, bias=False),
@@ -263,6 +284,56 @@ class TrackPreFilter(nn.Module):
 
         return scores
 
+    def _pna_aggregate(
+        self,
+        neighbor_features: torch.Tensor,
+        neighbor_validity: torch.Tensor,
+    ) -> torch.Tensor:
+        """PNA multi-aggregation over kNN neighbors.
+
+        Computes 4 aggregation functions in parallel (Corso et al., NeurIPS 2020):
+            mean_j(h_j), max_j(h_j), min_j(h_j), std_j(h_j)
+        where j ranges over valid neighbors.
+
+        Args:
+            neighbor_features: (B, H, P, K) features gathered from neighbors.
+            neighbor_validity: (B, 1, P, K) validity mask for neighbors.
+
+        Returns:
+            aggregated: (B, 4*H, P) concatenation of [mean, max, min, std].
+        """
+        num_valid = neighbor_validity.sum(dim=-1).clamp(min=1.0)
+
+        masked_for_mean = neighbor_features * neighbor_validity
+        mean_aggregated = masked_for_mean.sum(dim=-1) / num_valid
+
+        masked_for_max = neighbor_features.masked_fill(
+            neighbor_validity == 0, float('-inf'),
+        )
+        max_aggregated = masked_for_max.max(dim=-1)[0]
+        max_aggregated = max_aggregated.masked_fill(
+            max_aggregated == float('-inf'), 0.0,
+        )
+
+        masked_for_min = neighbor_features.masked_fill(
+            neighbor_validity == 0, float('inf'),
+        )
+        min_aggregated = masked_for_min.min(dim=-1)[0]
+        min_aggregated = min_aggregated.masked_fill(
+            min_aggregated == float('inf'), 0.0,
+        )
+
+        # std = sqrt(E[x²] - E[x]² + ε)
+        mean_of_squares = (masked_for_mean ** 2).sum(dim=-1) / num_valid
+        std_aggregated = (
+            (mean_of_squares - mean_aggregated ** 2).clamp(min=1e-6).sqrt()
+        )
+
+        return torch.cat(
+            [mean_aggregated, max_aggregated, min_aggregated, std_aggregated],
+            dim=1,
+        )
+
     def _forward_mlp(
         self,
         points: torch.Tensor,
@@ -288,7 +359,6 @@ class TrackPreFilter(nn.Module):
         # Multi-round message passing
         current = track_embedding
         for round_index in range(self.num_message_rounds):
-            # Gather neighbor features: (B, hidden_dim, P, K)
             neighbor_features = cross_set_gather(
                 current, neighbor_indices,
             )
@@ -296,17 +366,23 @@ class TrackPreFilter(nn.Module):
                 mask.float(), neighbor_indices,
             )
 
-            # Max-pool aggregation over valid neighbors
-            neighbor_features = neighbor_features.masked_fill(
-                neighbor_validity == 0, float('-inf'),
-            )
-            max_pooled = neighbor_features.max(dim=-1)[0]  # (B, H, P)
-            max_pooled = max_pooled.masked_fill(
-                max_pooled == float('-inf'), 0.0,
-            )
+            if self.aggregation_mode == 'pna':
+                # PNA: cat([current, mean, max, min, std]) → (B, 5*H, P)
+                pna_aggregated = self._pna_aggregate(
+                    neighbor_features, neighbor_validity,
+                )
+                aggregated = torch.cat([current, pna_aggregated], dim=1)
+            else:
+                # Standard max-pool: cat([current, max_pooled]) → (B, 2*H, P)
+                neighbor_features = neighbor_features.masked_fill(
+                    neighbor_validity == 0, float('-inf'),
+                )
+                max_pooled = neighbor_features.max(dim=-1)[0]
+                max_pooled = max_pooled.masked_fill(
+                    max_pooled == float('-inf'), 0.0,
+                )
+                aggregated = torch.cat([current, max_pooled], dim=1)
 
-            # Combine current + neighborhood, project back to hidden_dim
-            aggregated = torch.cat([current, max_pooled], dim=1)
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
 
         # Score
@@ -550,9 +626,20 @@ class TrackPreFilter(nn.Module):
 
             # L = T × log(1 + exp((s_neg - s_pos) / T))
             # At T=1: standard softplus. At T>1: smoother. At T<1: sharper.
-            pairwise_loss = temperature * functional.softplus(
-                (negative_scores - positive_scores) / temperature,
-            )
+            scaled_margin = (negative_scores - positive_scores) / temperature
+            pairwise_loss = temperature * functional.softplus(scaled_margin)
+
+            # Equalized focal weighting (Li et al., CVPR 2022):
+            # w = (1 - p)^γ where p = σ(s_pos - s_neg) = prob of correct ordering.
+            # Easy pairs (large margin, p→1): downweighted. Hard pairs: full weight.
+            # .detach() prevents focal weights from generating own gradients.
+            # Unlike ASL's hard clip, this NEVER zeros any gradient.
+            if self.focal_gamma > 0:
+                ordering_probability = torch.sigmoid(-scaled_margin)
+                focal_weight = (
+                    (1.0 - ordering_probability).pow(self.focal_gamma)
+                ).detach()
+                pairwise_loss = focal_weight * pairwise_loss
 
             # DRW: upweight positive-negative pairs after warmup
             if self._drw_active:
@@ -637,90 +724,98 @@ class TrackPreFilter(nn.Module):
         track_labels: torch.Tensor,
         original_scores: torch.Tensor,
     ) -> torch.Tensor:
-        """Contrastive denoising: score noised copies of GT tracks.
+        """DINO-style contrastive denoising loss.
 
-        Creates copies of GT track features with small Gaussian noise
-        (hard positives). Runs ONE batched forward pass on the entire
-        noised batch and computes ranking loss where noised GT tracks
-        should score ABOVE background.
+        Creates two types of noised GT track copies (Zhang et al., ICLR 2023):
+        1. Positive copies (small noise, scheduled σ): must score ABOVE background.
+        2. Negative copies (large noise, σ_neg): must score BELOW positive copies.
+           Teaches the decision boundary between real pions and "almost-pions."
 
-        Vectorized: builds the noised batch in one operation using a
-        boolean GT mask, runs a single self.forward() call for the
-        full batch, then loops only over events for the cheap ranking
-        loss computation (the forward pass was the bottleneck).
+        Vectorized: batched forward passes, per-event loop only for indexing.
 
         Args:
             points, features, lorentz_vectors, mask, track_labels: Original batch.
             original_scores: (B, P) scores from the non-noised forward pass.
 
         Returns:
-            Scalar denoising loss.
+            Scalar denoising loss (positive part + negative part if enabled).
         """
-        valid_mask = mask.squeeze(1).bool()  # (B, P)
+        valid_mask = mask.squeeze(1).bool()
         labels_flat = (
             track_labels.squeeze(1)[:, :valid_mask.shape[1]] * valid_mask.float()
         )
 
-        # Build GT mask across the entire batch: (B, P)
-        gt_mask = (labels_flat == 1.0) & valid_mask  # (B, P)
+        gt_mask = (labels_flat == 1.0) & valid_mask
 
-        # If no GT tracks in the entire batch, return zero loss
         if not gt_mask.any():
             return torch.tensor(0.0, device=features.device, dtype=features.dtype)
 
-        # Clone features and add noise to ALL GT positions at once.
-        # Hard positive: small Gaussian noise (scheduled sigma)
-        noised_features = features.clone()  # (B, C, P)
-        # gt_mask_expanded: (B, 1, P) for broadcasting with (B, C, P)
-        gt_mask_expanded = gt_mask.unsqueeze(1)  # (B, 1, P)
-        noise = torch.randn_like(noised_features) * self.current_denoising_sigma
-        # Only add noise at GT positions; leave background features unchanged
-        noised_features = torch.where(
-            gt_mask_expanded, noised_features + noise, noised_features,
+        gt_mask_expanded = gt_mask.unsqueeze(1)
+
+        # --- Positive copies: small noise (scheduled sigma) ---
+        positive_noise = (
+            torch.randn_like(features) * self.current_denoising_sigma
+        )
+        positive_noised_features = torch.where(
+            gt_mask_expanded, features + positive_noise, features,
+        )
+        positive_noised_scores = self.forward(
+            points, positive_noised_features, lorentz_vectors, mask,
         )
 
-        # ONE batched forward pass on the full noised batch
-        noised_scores = self.forward(
-            points, noised_features, lorentz_vectors, mask,
-        )  # (B, P)
+        # --- Negative copies: large noise (if enabled) ---
+        use_negative_copies = self.contrastive_denoising_negative_sigma > 0
+        if use_negative_copies:
+            negative_noise = (
+                torch.randn_like(features)
+                * self.contrastive_denoising_negative_sigma
+            )
+            negative_noised_features = torch.where(
+                gt_mask_expanded, features + negative_noise, features,
+            )
+            negative_noised_scores = self.forward(
+                points, negative_noised_features, lorentz_vectors, mask,
+            )
 
-        # Compute per-event ranking loss (cheap loop -- only indexing, no forward pass)
+        # --- Per-event loss (cheap — no forward passes) ---
         batch_size = features.shape[0]
         temperature = self.current_ranking_temperature
         event_losses = []
 
         for event_index in range(batch_size):
             gt_positions = gt_mask[event_index].nonzero(as_tuple=True)[0]
-
             if len(gt_positions) == 0:
                 continue
 
-            # Noised GT tracks should still score higher than background
-            positive_scores = noised_scores[event_index, gt_positions]  # (num_gt,)
+            pos_scores = positive_noised_scores[event_index, gt_positions]
 
             negative_indices = (
-                (labels_flat[event_index] == 0.0)
-                & valid_mask[event_index]
+                (labels_flat[event_index] == 0.0) & valid_mask[event_index]
             ).nonzero(as_tuple=True)[0]
-
             if len(negative_indices) == 0:
                 continue
 
-            # Sample negatives from the original (non-noised) scores
             num_samples = min(20, len(negative_indices))
             sample_idx = torch.randint(
                 0, len(negative_indices), (num_samples,),
                 device=features.device,
             )
-            negative_scores = original_scores[event_index, negative_indices[sample_idx]]
+            bg_scores = original_scores[event_index, negative_indices[sample_idx]]
 
-            # Pairwise ranking: noised positives should beat negatives
-            # L = T * softplus((s_neg - s_pos) / T), temperature-scaled
-            pairwise = temperature * functional.softplus(
-                (negative_scores.unsqueeze(0) - positive_scores.unsqueeze(1))
-                / temperature,
+            # Loss 1: positive copies should beat background
+            positive_pairwise = temperature * functional.softplus(
+                (bg_scores.unsqueeze(0) - pos_scores.unsqueeze(1)) / temperature,
             )
-            event_losses.append(pairwise.mean())
+            event_losses.append(positive_pairwise.mean())
+
+            # Loss 2 (DINO): negative copies should score BELOW positive copies
+            if use_negative_copies:
+                neg_scores = negative_noised_scores[event_index, gt_positions]
+                negative_pairwise = temperature * functional.softplus(
+                    (neg_scores.unsqueeze(1) - pos_scores.unsqueeze(0))
+                    / temperature,
+                )
+                event_losses.append(negative_pairwise.mean())
 
         if not event_losses:
             return torch.tensor(0.0, device=features.device, dtype=features.dtype)
