@@ -187,9 +187,11 @@ def cross_set_knn(
         self_mask = (reference_range == self_indices)  # (B, M, P)
         distances = distances.masked_fill(self_mask, float('inf'))
 
-    # Select K nearest neighbors (smallest distances)
+    # Select K nearest neighbors (smallest distances).
+    # sorted=False: downstream operations (attention sum, max-pool over K)
+    # are permutation-invariant, so sorting is unnecessary overhead.
     neighbor_indices = distances.topk(
-        k=num_neighbors, dim=-1, largest=False, sorted=True
+        k=num_neighbors, dim=-1, largest=False, sorted=False
     )[1]  # (B, M, K)
 
     return neighbor_indices

@@ -156,25 +156,30 @@ class GAPLayer(nn.Module):
         features: torch.Tensor,
         neighbor_indices: torch.Tensor,
         mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute MIA high-dimensional attention weights.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute MIA high-dimensional attention weights and intermediates.
 
-        Returns (B, encoding_dim, P, K) softmax attention weights where
-        each of encoding_dim channels is an independent attention head.
+        Returns a tuple of:
+            attention_weights: (B, encoding_dim, P, K) softmax attention weights
+                where each of encoding_dim channels is an independent attention head.
+            encoded_edges: (B, encoding_dim, P, K) edge embeddings from mia_edge_embed,
+                reusable for graph feature max-pool without recomputation.
+            neighbor_validity: (B, 1, P, K) mask indicating valid neighbors,
+                reusable for masking in downstream aggregation.
         """
         # Gather neighbor features and compute edge features
         neighbor_features = cross_set_gather(features, neighbor_indices)
         center_expanded = features.unsqueeze(-1).expand_as(neighbor_features)
         edge_features = neighbor_features - center_expanded  # (B, input_dim, P, K)
 
-        # MLP → (B, encoding_dim, P, K) attention logits
-        attention_logits = self.mia_edge_embed(edge_features)
+        # MLP → (B, encoding_dim, P, K) encoded edge embeddings
+        encoded_edges = self.mia_edge_embed(edge_features)
 
         # Mask invalid neighbors
         neighbor_validity = cross_set_gather(
             mask.float(), neighbor_indices,
         )  # (B, 1, P, K)
-        attention_logits = attention_logits.masked_fill(
+        attention_logits = encoded_edges.masked_fill(
             neighbor_validity == 0, float('-inf'),
         )
 
@@ -186,7 +191,7 @@ class GAPLayer(nn.Module):
             )
         attention_weights = attention_weights.nan_to_num(0.0)
 
-        return attention_weights
+        return attention_weights, encoded_edges, neighbor_validity
 
     def _forward_mia(
         self,
@@ -201,10 +206,17 @@ class GAPLayer(nn.Module):
 
         output_i = sum_j softmax_j(MLP(f_j - f_i))[c] * V(f_j)[c]
         for each channel c independently (encoding_dim heads, head_dim=1).
+
+        Reuses encoded_edges and neighbor_validity from attention weight
+        computation to avoid redundant cross_set_gather and mia_edge_embed calls.
         """
-        # Attention weights from edge geometry: (B, encoding_dim, P, K)
-        attention_weights = self.compute_mia_attention_weights(
-            features, neighbor_indices, mask,
+        # Attention weights + intermediates from edge geometry.
+        # encoded_edges: (B, encoding_dim, P, K) — reused for graph features.
+        # neighbor_validity: (B, 1, P, K) — reused for masking graph features.
+        attention_weights, encoded_edges, neighbor_validity = (
+            self.compute_mia_attention_weights(
+                features, neighbor_indices, mask,
+            )
         )
 
         # Value projection: (B, input_dim, P) → (B, encoding_dim, P)
@@ -219,16 +231,12 @@ class GAPLayer(nn.Module):
         attention_output = (attention_weights * neighbor_values).sum(dim=-1)
         attention_output = functional.relu(attention_output)  # (B, encoding_dim, P)
 
-        # Graph features: max-pool over encoded edges (same as standard mode)
-        neighbor_features = cross_set_gather(features, neighbor_indices)
-        center_expanded = features.unsqueeze(-1).expand_as(neighbor_features)
-        edge_features = neighbor_features - center_expanded
-        encoded_edges = self.mia_edge_embed(edge_features)  # Reuse MIA embed
-        neighbor_validity = cross_set_gather(mask.float(), neighbor_indices)
-        encoded_edges = encoded_edges.masked_fill(
+        # Graph features: max-pool over encoded edges (reuse from attention computation)
+        # Mask invalid neighbors before max-pool
+        encoded_edges_masked = encoded_edges.masked_fill(
             neighbor_validity == 0, float('-inf'),
         )
-        graph_features = encoded_edges.max(dim=-1)[0]
+        graph_features = encoded_edges_masked.max(dim=-1)[0]
         graph_features = graph_features.masked_fill(
             graph_features == float('-inf'), 0.0,
         )
@@ -607,47 +615,114 @@ class TauTrackFinderV3(nn.Module):
         self,
         features: torch.Tensor,
         mask: torch.Tensor,
+        chunk_size: int = 256,
     ) -> torch.Tensor:
-        """Compute kNN indices in learned feature space.
+        """Compute kNN indices in learned feature space using chunked distances.
 
-        Uses pairwise L2 distance in the high-dimensional feature space.
-        This allows finding tracks that are similar in learned representation
-        even if far apart in (eta, phi).
+        Avoids materializing the full (B, P, P) distance matrix by processing
+        query tracks in chunks of `chunk_size`. Each chunk computes distances
+        to ALL reference tracks and extracts top-K, then results are concatenated.
+
+        Uses the expanded L2 distance formula:
+            ||f_i - f_j||^2 = ||f_i||^2 + ||f_j||^2 - 2 * f_i^T f_j
+
+        Pre-computes squared norms once, then each chunk only needs a
+        (B, chunk, P) bmm instead of the full (B, P, P).
+
+        Self-matches are excluded by setting diagonal distances to +inf,
+        preventing a track from being its own neighbor.
 
         Args:
             features: (B, C, P) intermediate features.
             mask: (B, 1, P) boolean mask.
+            chunk_size: Number of query tracks to process at once (default: 256).
 
         Returns:
             neighbor_indices: (B, P, K) kNN indices.
         """
         with torch.no_grad():
-            # Pairwise L2 distance in feature space
-            # features: (B, C, P) -> transpose to (B, P, C) for distance
+            # features: (B, C, P) -> transpose to (B, P, C) for distance computation
             features_transposed = features.transpose(1, 2)  # (B, P, C)
+            batch_size, num_tracks, feature_dim = features_transposed.shape
 
-            # ||f_i - f_j||^2 = ||f_i||^2 + ||f_j||^2 - 2 * f_i^T f_j
-            feature_norms_squared = (
-                features_transposed.pow(2).sum(dim=-1, keepdim=True)
+            # Pre-compute squared norms: ||f_i||^2 for all tracks
+            # norms_squared: (B, P, 1) — reused across all chunks
+            norms_squared = features_transposed.pow(2).sum(
+                dim=-1, keepdim=True,
             )  # (B, P, 1)
-            pairwise_distances = (
-                feature_norms_squared
-                + feature_norms_squared.transpose(1, 2)
-                - 2.0 * torch.bmm(
-                    features_transposed, features_transposed.transpose(1, 2),
-                )
-            )  # (B, P, P)
 
-            # Mask invalid reference points: set distance to +inf
+            # Transpose of all features for bmm: (B, C, P)
+            features_for_dot_product = features_transposed.transpose(1, 2)  # (B, C, P)
+
+            # Pre-compute invalid mask for reference points
             mask_flat = mask.squeeze(1)  # (B, P)
             invalid_mask = ~mask_flat.bool()  # (B, P)
-            pairwise_distances.masked_fill_(
-                invalid_mask.unsqueeze(1), float('inf'),
-            )
+            # Reference norms transposed: (B, 1, P) for broadcasting
+            norms_squared_reference = norms_squared.transpose(1, 2)  # (B, 1, P)
 
-            # kNN: select K nearest neighbors per point
-            _, neighbor_indices = pairwise_distances.topk(
-                self.gap2_num_neighbors, dim=-1, largest=False,
+            # Process query tracks in chunks
+            chunk_indices_list = []
+
+            for chunk_start in range(0, num_tracks, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_tracks)
+                current_chunk_size = chunk_end - chunk_start
+
+                # Chunk of query features: (B, chunk, C)
+                chunk_features = features_transposed[
+                    :, chunk_start:chunk_end, :
+                ]  # (B, chunk, C)
+
+                # Chunk norms: (B, chunk, 1)
+                chunk_norms = norms_squared[
+                    :, chunk_start:chunk_end, :
+                ]  # (B, chunk, 1)
+
+                # Chunk pairwise distances via expanded formula:
+                # ||f_i - f_j||^2 = ||f_i||^2 + ||f_j||^2 - 2 * f_i^T f_j
+                # chunk_norms: (B, chunk, 1) broadcasts with norms_ref: (B, 1, P)
+                # dot_product: (B, chunk, C) @ (B, C, P) = (B, chunk, P)
+                dot_product = torch.bmm(
+                    chunk_features, features_for_dot_product,
+                )  # (B, chunk, P)
+                chunk_distances = (
+                    chunk_norms + norms_squared_reference - 2.0 * dot_product
+                )  # (B, chunk, P)
+
+                # Mask invalid reference points: set distance to +inf
+                chunk_distances.masked_fill_(
+                    invalid_mask.unsqueeze(1), float('inf'),
+                )
+
+                # Exclude self-matches: set diagonal distance to +inf.
+                # For chunk [chunk_start:chunk_end], self-match is at column
+                # index == row_global_index, i.e., column chunk_start + local_row.
+                if chunk_end > chunk_start:
+                    batch_range = torch.arange(
+                        batch_size, device=features.device,
+                    )
+                    local_range = torch.arange(
+                        current_chunk_size, device=features.device,
+                    )
+                    global_indices = local_range + chunk_start
+                    # Set self-match distances to inf: chunk_distances[b, i, chunk_start+i]
+                    chunk_distances[
+                        batch_range.unsqueeze(1),
+                        local_range.unsqueeze(0),
+                        global_indices.unsqueeze(0),
+                    ] = float('inf')
+
+                # kNN per chunk: select K nearest neighbors.
+                # sorted=False: downstream GAPLayer operations (attention-weighted
+                # sum, max-pool) are permutation-invariant over neighbors.
+                _, chunk_neighbor_indices = chunk_distances.topk(
+                    self.gap2_num_neighbors, dim=-1, largest=False, sorted=False,
+                )  # (B, chunk, K)
+
+                chunk_indices_list.append(chunk_neighbor_indices)
+
+            # Concatenate all chunks along the query dimension
+            neighbor_indices = torch.cat(
+                chunk_indices_list, dim=1,
             )  # (B, P, K)
 
         return neighbor_indices
@@ -770,6 +845,11 @@ class TauTrackFinderV3(nn.Module):
         Evidence: val loss stalls at 0.00274 from epoch 15-50, but R@30
         improves 0.216→0.239 (+10.6%). BCE cannot capture ranking quality;
         this loss provides gradient signal for those improvements.
+
+        # TODO: Vectorize this loop across the batch using padded positives
+        # and a single torch.randint call. The per-event loop is kept for now
+        # because it operates on tiny tensors and the main performance
+        # bottlenecks are elsewhere (kNN, forward passes).
 
         Args:
             predicted_logits: (B, N) per-track logits.

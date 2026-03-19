@@ -505,7 +505,7 @@ class TrackPreFilter(nn.Module):
 
         For each GT pion, sample S negatives and penalize negatives
         scoring above positives:
-            L = T × softplus((s_neg - s_pos) / T)
+            L = T * softplus((s_neg - s_pos) / T)
 
         At T=1.0, this reduces to standard softplus(s_neg - s_pos).
         High T smooths gradients across more pairs; low T sharpens
@@ -513,6 +513,11 @@ class TrackPreFilter(nn.Module):
 
         When DRW is active, the loss is scaled by drw_positive_weight
         to upweight the rare positive class.
+
+        # TODO: Vectorize this loop across the batch using padded positives
+        # and a single torch.randint call. The per-event loop is kept for now
+        # because the main cost savings come from the vectorized contrastive
+        # denoising loss (Opt 2), and this loop operates on tiny tensors.
         """
         batch_size = scores.shape[0]
         temperature = self.current_ranking_temperature
@@ -635,14 +640,14 @@ class TrackPreFilter(nn.Module):
         """Contrastive denoising: score noised copies of GT tracks.
 
         Creates copies of GT track features with small Gaussian noise
-        (hard positives) and large noise (hard negatives). Runs the model
-        on the noised features and computes ranking loss where:
-        - Hard positives should score ABOVE background
-        - Hard negatives should score BELOW hard positives
+        (hard positives). Runs ONE batched forward pass on the entire
+        noised batch and computes ranking loss where noised GT tracks
+        should score ABOVE background.
 
-        This multiplies effective positive examples by ~3x without
-        fabricating unrealistic samples (noise stays within the feature
-        distribution).
+        Vectorized: builds the noised batch in one operation using a
+        boolean GT mask, runs a single self.forward() call for the
+        full batch, then loops only over events for the cheap ranking
+        loss computation (the forward pass was the bottleneck).
 
         Args:
             points, features, lorentz_vectors, mask, track_labels: Original batch.
@@ -651,43 +656,48 @@ class TrackPreFilter(nn.Module):
         Returns:
             Scalar denoising loss.
         """
-        batch_size = features.shape[0]
-        valid_mask = mask.squeeze(1).bool()
+        valid_mask = mask.squeeze(1).bool()  # (B, P)
         labels_flat = (
             track_labels.squeeze(1)[:, :valid_mask.shape[1]] * valid_mask.float()
         )
 
+        # Build GT mask across the entire batch: (B, P)
+        gt_mask = (labels_flat == 1.0) & valid_mask  # (B, P)
+
+        # If no GT tracks in the entire batch, return zero loss
+        if not gt_mask.any():
+            return torch.tensor(0.0, device=features.device, dtype=features.dtype)
+
+        # Clone features and add noise to ALL GT positions at once.
+        # Hard positive: small Gaussian noise (scheduled sigma)
+        noised_features = features.clone()  # (B, C, P)
+        # gt_mask_expanded: (B, 1, P) for broadcasting with (B, C, P)
+        gt_mask_expanded = gt_mask.unsqueeze(1)  # (B, 1, P)
+        noise = torch.randn_like(noised_features) * self.current_denoising_sigma
+        # Only add noise at GT positions; leave background features unchanged
+        noised_features = torch.where(
+            gt_mask_expanded, noised_features + noise, noised_features,
+        )
+
+        # ONE batched forward pass on the full noised batch
+        noised_scores = self.forward(
+            points, noised_features, lorentz_vectors, mask,
+        )  # (B, P)
+
+        # Compute per-event ranking loss (cheap loop -- only indexing, no forward pass)
+        batch_size = features.shape[0]
+        temperature = self.current_ranking_temperature
         event_losses = []
 
         for event_index in range(batch_size):
-            gt_positions = (
-                (labels_flat[event_index] == 1.0)
-                & valid_mask[event_index]
-            ).nonzero(as_tuple=True)[0]
+            gt_positions = gt_mask[event_index].nonzero(as_tuple=True)[0]
 
             if len(gt_positions) == 0:
                 continue
 
-            # Create noised features: replace GT track features with noised versions
-            # Hard positive: small noise (scheduled sigma)
-            noised_features = features[event_index:event_index + 1].clone()
-            noise = torch.randn_like(
-                noised_features[:, :, gt_positions],
-            ) * self.current_denoising_sigma
-            noised_features[:, :, gt_positions] = (
-                noised_features[:, :, gt_positions] + noise
-            )
+            # Noised GT tracks should still score higher than background
+            positive_scores = noised_scores[event_index, gt_positions]  # (num_gt,)
 
-            # Score the noised version
-            noised_scores = self.forward(
-                points[event_index:event_index + 1],
-                noised_features,
-                lorentz_vectors[event_index:event_index + 1],
-                mask[event_index:event_index + 1],
-            )  # (1, P)
-
-            # The noised GT tracks should still score higher than background
-            positive_scores = noised_scores[0, gt_positions]  # (num_gt,)
             negative_indices = (
                 (labels_flat[event_index] == 0.0)
                 & valid_mask[event_index]
@@ -696,7 +706,7 @@ class TrackPreFilter(nn.Module):
             if len(negative_indices) == 0:
                 continue
 
-            # Sample negatives
+            # Sample negatives from the original (non-noised) scores
             num_samples = min(20, len(negative_indices))
             sample_idx = torch.randint(
                 0, len(negative_indices), (num_samples,),
@@ -705,8 +715,7 @@ class TrackPreFilter(nn.Module):
             negative_scores = original_scores[event_index, negative_indices[sample_idx]]
 
             # Pairwise ranking: noised positives should beat negatives
-            # L = T × softplus((s_neg - s_pos) / T), temperature-scaled
-            temperature = self.current_ranking_temperature
+            # L = T * softplus((s_neg - s_pos) / T), temperature-scaled
             pairwise = temperature * functional.softplus(
                 (negative_scores.unsqueeze(0) - positive_scores.unsqueeze(1))
                 / temperature,
@@ -714,7 +723,7 @@ class TrackPreFilter(nn.Module):
             event_losses.append(pairwise.mean())
 
         if not event_losses:
-            return torch.tensor(0.0, device=features.device)
+            return torch.tensor(0.0, device=features.device, dtype=features.dtype)
         return torch.stack(event_losses).mean()
 
     def select_top_k(

@@ -97,10 +97,12 @@ def pairwise_distance_etaphi(x):
 
 def knn(x, k, distance_fn=pairwise_distance_etaphi, exclude_self=False):
     # distance: (b, i, j)
+    # sorted=False: downstream EdgeConv aggregation (max-pool) is
+    # permutation-invariant over K neighbors, so sorting is unnecessary.
     if exclude_self:
-        idx = distance_fn(x).topk(k=k + 1, dim=-1, largest=False, sorted=True)[1][:, :, 1:]  # (b, i, k)
+        idx = distance_fn(x).topk(k=k + 1, dim=-1, largest=False, sorted=False)[1][:, :, 1:]  # (b, i, k)
     else:
-        idx = distance_fn(x).topk(k=k, dim=-1, largest=False, sorted=True)[1]  # (b, i, k)
+        idx = distance_fn(x).topk(k=k, dim=-1, largest=False, sorted=False)[1]  # (b, i, k)
     return idx
 
 
