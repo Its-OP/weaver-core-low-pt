@@ -589,6 +589,7 @@ class TrackPreFilter(nn.Module):
             loss_dict['reconstruction_loss'] = reconstruction_loss
 
         loss_dict['total_loss'] = total_loss
+        loss_dict['_scores'] = scores
         return loss_dict
 
     def _contrastive_denoising_loss(
