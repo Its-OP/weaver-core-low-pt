@@ -51,6 +51,12 @@ class TrackPreFilter(nn.Module):
         use_lorentz_vectors: bool = False,
         num_message_rounds: int = 1,
         use_gap_attention: bool = False,
+        denoising_sigma_start: float = 0.3,
+        denoising_sigma_end: float = 0.3,
+        ranking_temperature_start: float = 1.0,
+        ranking_temperature_end: float = 1.0,
+        drw_warmup_fraction: float = 1.0,
+        drw_positive_weight: float = 1.0,
     ):
         super().__init__()
         self.mode = mode
@@ -61,6 +67,23 @@ class TrackPreFilter(nn.Module):
         self.use_lorentz_vectors = use_lorentz_vectors
         self.num_message_rounds = num_message_rounds
         self.use_gap_attention = use_gap_attention
+
+        # Temperature scheduling (Kukleva et al., ICLR 2023):
+        # σ(t) linearly interpolates between sigma_start and sigma_end.
+        # T(t) linearly interpolates between temperature_start and temperature_end.
+        # High T → smooth gradients from many pairs; low T → sharp focus on hard violations.
+        self.denoising_sigma_start = denoising_sigma_start
+        self.denoising_sigma_end = denoising_sigma_end
+        self.ranking_temperature_start = ranking_temperature_start
+        self.ranking_temperature_end = ranking_temperature_end
+        self._temperature_progress: float = 0.0
+
+        # Deferred Re-Weighting (Cao et al., NeurIPS 2019):
+        # Train with uniform weights for drw_warmup_fraction of training,
+        # then upweight positive-negative pairs by drw_positive_weight.
+        self.drw_warmup_fraction = drw_warmup_fraction
+        self.drw_positive_weight = drw_positive_weight
+        self._drw_active: bool = False
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
@@ -83,12 +106,17 @@ class TrackPreFilter(nn.Module):
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
             )
-            # Neighbor aggregation MLP
-            self.neighbor_mlp = nn.Sequential(
-                nn.Conv1d(2 * hidden_dim, hidden_dim, kernel_size=1, bias=False),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(),
-            )
+            # Neighbor aggregation — repeated for each message round
+            # cat([current, max_pooled]) = 2 * hidden_dim → hidden_dim
+            neighbor_input_dim = 2 * hidden_dim
+            self.neighbor_mlps = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv1d(neighbor_input_dim, hidden_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                )
+                for _ in range(num_message_rounds)
+            ])
             # Scoring head
             self.scorer = nn.Sequential(
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
@@ -241,13 +269,13 @@ class TrackPreFilter(nn.Module):
         features: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Mode A: Per-track MLP with kNN neighborhood context."""
+        """Mode A: Per-track MLP with multi-round kNN neighborhood context."""
         mask_float = mask.float()
 
         # Per-track embedding
         track_embedding = self.track_mlp(features) * mask_float  # (B, H, P)
 
-        # kNN in (eta, phi) + max-pool neighbors
+        # kNN indices in (eta, phi), computed once and reused across rounds
         with torch.no_grad():
             neighbor_indices = cross_set_knn(
                 query_coordinates=points,
@@ -257,26 +285,32 @@ class TrackPreFilter(nn.Module):
                 query_reference_indices=None,
             )
 
-        neighbor_features = cross_set_gather(
-            track_embedding, neighbor_indices,
-        )  # (B, H, P, K)
-        neighbor_validity = cross_set_gather(
-            mask.float(), neighbor_indices,
-        )
-        neighbor_features = neighbor_features.masked_fill(
-            neighbor_validity == 0, float('-inf'),
-        )
-        max_pooled = neighbor_features.max(dim=-1)[0]  # (B, H, P)
-        max_pooled = max_pooled.masked_fill(
-            max_pooled == float('-inf'), 0.0,
-        )
+        # Multi-round message passing
+        current = track_embedding
+        for round_index in range(self.num_message_rounds):
+            # Gather neighbor features: (B, hidden_dim, P, K)
+            neighbor_features = cross_set_gather(
+                current, neighbor_indices,
+            )
+            neighbor_validity = cross_set_gather(
+                mask.float(), neighbor_indices,
+            )
 
-        # Combine track + neighborhood
-        combined = torch.cat([track_embedding, max_pooled], dim=1)
-        combined = self.neighbor_mlp(combined) * mask_float
+            # Max-pool aggregation over valid neighbors
+            neighbor_features = neighbor_features.masked_fill(
+                neighbor_validity == 0, float('-inf'),
+            )
+            max_pooled = neighbor_features.max(dim=-1)[0]  # (B, H, P)
+            max_pooled = max_pooled.masked_fill(
+                max_pooled == float('-inf'), 0.0,
+            )
+
+            # Combine current + neighborhood, project back to hidden_dim
+            aggregated = torch.cat([current, max_pooled], dim=1)
+            current = self.neighbor_mlps[round_index](aggregated) * mask_float
 
         # Score
-        scores = self.scorer(combined).squeeze(1)  # (B, P)
+        scores = self.scorer(current).squeeze(1)  # (B, P)
         return scores
 
     def _forward_two_tower(
@@ -416,18 +450,72 @@ class TrackPreFilter(nn.Module):
         scores = self.scorer(current).squeeze(1)
         return scores
 
+    # ---- Training schedule methods ----
+
+    def set_temperature_progress(self, progress: float) -> None:
+        """Set curriculum progress for temperature and sigma scheduling.
+
+        Linearly interpolates between start and end values:
+            σ(t) = σ_start + t × (σ_end - σ_start)
+            T(t) = T_start + t × (T_end - T_start)
+
+        Args:
+            progress: Float in [0, 1]. 0 = start of training, 1 = end.
+        """
+        self._temperature_progress = max(0.0, min(1.0, progress))
+
+    @property
+    def current_denoising_sigma(self) -> float:
+        """Current noise sigma for contrastive denoising, interpolated by progress."""
+        return (
+            self.denoising_sigma_start
+            + self._temperature_progress
+            * (self.denoising_sigma_end - self.denoising_sigma_start)
+        )
+
+    @property
+    def current_ranking_temperature(self) -> float:
+        """Current temperature for ranking loss, interpolated by progress."""
+        return (
+            self.ranking_temperature_start
+            + self._temperature_progress
+            * (self.ranking_temperature_end - self.ranking_temperature_start)
+        )
+
+    def set_drw_active(self, active: bool) -> None:
+        """Activate/deactivate Deferred Re-Weighting of positive samples.
+
+        DRW (Cao et al. 2019): train with uniform weights first to learn
+        representations, then upweight rare-class samples for ranking.
+
+        Args:
+            active: If True, multiply ranking loss by drw_positive_weight.
+        """
+        self._drw_active = active
+
+    # ---- Loss functions ----
+
     def _ranking_loss(
         self,
         scores: torch.Tensor,
         labels: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Pairwise ranking loss optimized for recall@K.
+        """Temperature-scaled pairwise ranking loss optimized for recall@K.
 
         For each GT pion, sample S negatives and penalize negatives
-        scoring above positives.
+        scoring above positives:
+            L = T × softplus((s_neg - s_pos) / T)
+
+        At T=1.0, this reduces to standard softplus(s_neg - s_pos).
+        High T smooths gradients across more pairs; low T sharpens
+        focus on hard violations near the decision boundary.
+
+        When DRW is active, the loss is scaled by drw_positive_weight
+        to upweight the rare positive class.
         """
         batch_size = scores.shape[0]
+        temperature = self.current_ranking_temperature
         event_losses = []
 
         for event_index in range(batch_size):
@@ -455,10 +543,16 @@ class TrackPreFilter(nn.Module):
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
 
-            # L = log(1 + exp(s_neg - s_pos)), numerically stable via softplus
-            pairwise_loss = functional.softplus(
-                negative_scores - positive_scores,
+            # L = T × log(1 + exp((s_neg - s_pos) / T))
+            # At T=1: standard softplus. At T>1: smoother. At T<1: sharper.
+            pairwise_loss = temperature * functional.softplus(
+                (negative_scores - positive_scores) / temperature,
             )
+
+            # DRW: upweight positive-negative pairs after warmup
+            if self._drw_active:
+                pairwise_loss = pairwise_loss * self.drw_positive_weight
+
             event_losses.append(pairwise_loss.mean())
 
         if not event_losses:
@@ -575,11 +669,11 @@ class TrackPreFilter(nn.Module):
                 continue
 
             # Create noised features: replace GT track features with noised versions
-            # Hard positive: small noise (sigma=0.3)
+            # Hard positive: small noise (scheduled sigma)
             noised_features = features[event_index:event_index + 1].clone()
             noise = torch.randn_like(
                 noised_features[:, :, gt_positions],
-            ) * 0.3
+            ) * self.current_denoising_sigma
             noised_features[:, :, gt_positions] = (
                 noised_features[:, :, gt_positions] + noise
             )
@@ -611,9 +705,11 @@ class TrackPreFilter(nn.Module):
             negative_scores = original_scores[event_index, negative_indices[sample_idx]]
 
             # Pairwise ranking: noised positives should beat negatives
-            # L = log(1 + exp(s_neg - s_pos)), numerically stable via softplus
-            pairwise = functional.softplus(
-                negative_scores.unsqueeze(0) - positive_scores.unsqueeze(1),
+            # L = T × softplus((s_neg - s_pos) / T), temperature-scaled
+            temperature = self.current_ranking_temperature
+            pairwise = temperature * functional.softplus(
+                (negative_scores.unsqueeze(0) - positive_scores.unsqueeze(1))
+                / temperature,
             )
             event_losses.append(pairwise.mean())
 
