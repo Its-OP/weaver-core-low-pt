@@ -428,10 +428,7 @@ class TrackPreFilter(nn.Module):
         scoring above positives.
         """
         batch_size = scores.shape[0]
-        total_loss = torch.tensor(
-            0.0, device=scores.device, dtype=scores.dtype,
-        )
-        num_events_with_gt = 0
+        event_losses = []
 
         for event_index in range(batch_size):
             event_labels = labels[event_index]
@@ -448,7 +445,6 @@ class TrackPreFilter(nn.Module):
             if len(positive_indices) == 0 or len(negative_indices) == 0:
                 continue
 
-            num_events_with_gt += 1
             num_samples = min(self.ranking_num_samples, len(negative_indices))
             sample_idx = torch.randint(
                 0, len(negative_indices), (num_samples,),
@@ -459,74 +455,15 @@ class TrackPreFilter(nn.Module):
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
 
-            pairwise_loss = torch.log1p(
-                torch.exp(negative_scores - positive_scores),
+            # L = log(1 + exp(s_neg - s_pos)), numerically stable via softplus
+            pairwise_loss = functional.softplus(
+                negative_scores - positive_scores,
             )
-            total_loss = total_loss + pairwise_loss.mean()
+            event_losses.append(pairwise_loss.mean())
 
-        if num_events_with_gt == 0:
-            return total_loss
-        return total_loss / num_events_with_gt
-
-    def _create_denoising_copies(
-        self,
-        features: torch.Tensor,
-        track_labels: torch.Tensor,
-        mask: torch.Tensor,
-        noise_sigma_positive: float = 0.3,
-        noise_sigma_negative: float = 1.5,
-        num_copies: int = 3,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Create noised copies of GT tracks for contrastive denoising.
-
-        DN-DETR/DINO-inspired: for each GT pion, create:
-        - Hard positives: small noise (sigma=0.3), label=1
-        - Hard negatives: large noise (sigma=1.5), label=0
-
-        Returns per-track denoising targets and a mask for which
-        tracks are synthetic.
-
-        Args:
-            features: (B, C, P) raw features.
-            track_labels: (B, 1, P) binary labels.
-            mask: (B, 1, P) boolean mask.
-
-        Returns:
-            denoising_scores_target: (B, P) — 1.0 for hard positives
-                at GT positions (original + small noise), 0.0 elsewhere.
-                Hard negatives get explicit 0.0 target.
-            denoising_weight: (B, P) — weight for denoising loss.
-                1.0 for GT tracks and their noised copies, 0.0 elsewhere.
-        """
-        batch_size, num_channels, num_tracks = features.shape
-        labels_flat = track_labels.squeeze(1)  # (B, P)
-        valid_mask = mask.squeeze(1).bool()
-
-        # For each event, find GT positions and add noise to features
-        denoising_weight = torch.zeros(
-            batch_size, num_tracks, device=features.device,
-        )
-
-        for event_index in range(batch_size):
-            gt_positions = (
-                (labels_flat[event_index] == 1.0)
-                & valid_mask[event_index]
-            ).nonzero(as_tuple=True)[0]
-
-            if len(gt_positions) == 0:
-                continue
-
-            for gt_pos in gt_positions:
-                # Original GT track gets high weight
-                denoising_weight[event_index, gt_pos] = 1.0
-
-                # Add small noise to nearby background tracks to create
-                # implicit hard examples (the model should NOT score them high)
-                # This is done through the ranking loss already, so here
-                # we just upweight the GT tracks' contribution
-                denoising_weight[event_index, gt_pos] = num_copies
-
-        return denoising_weight
+        if not event_losses:
+            return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+        return torch.stack(event_losses).mean()
 
     def compute_loss(
         self,
@@ -626,8 +563,7 @@ class TrackPreFilter(nn.Module):
             track_labels.squeeze(1)[:, :valid_mask.shape[1]] * valid_mask.float()
         )
 
-        total_loss = torch.tensor(0.0, device=features.device)
-        num_events = 0
+        event_losses = []
 
         for event_index in range(batch_size):
             gt_positions = (
@@ -637,8 +573,6 @@ class TrackPreFilter(nn.Module):
 
             if len(gt_positions) == 0:
                 continue
-
-            num_events += 1
 
             # Create noised features: replace GT track features with noised versions
             # Hard positive: small noise (sigma=0.3)
@@ -677,16 +611,15 @@ class TrackPreFilter(nn.Module):
             negative_scores = original_scores[event_index, negative_indices[sample_idx]]
 
             # Pairwise ranking: noised positives should beat negatives
-            pairwise = torch.log1p(
-                torch.exp(
-                    negative_scores.unsqueeze(0) - positive_scores.unsqueeze(1)
-                ),
+            # L = log(1 + exp(s_neg - s_pos)), numerically stable via softplus
+            pairwise = functional.softplus(
+                negative_scores.unsqueeze(0) - positive_scores.unsqueeze(1),
             )
-            total_loss = total_loss + pairwise.mean()
+            event_losses.append(pairwise.mean())
 
-        if num_events == 0:
-            return total_loss
-        return total_loss / num_events
+        if not event_losses:
+            return torch.tensor(0.0, device=features.device)
+        return torch.stack(event_losses).mean()
 
     def select_top_k(
         self,

@@ -178,8 +178,12 @@ class GAPLayer(nn.Module):
             neighbor_validity == 0, float('-inf'),
         )
 
-        # Softmax over K independently per channel
-        attention_weights = functional.softmax(attention_logits, dim=-1)
+        # Softmax over K independently per channel.
+        # Force float32 to avoid precision loss under AMP autocast.
+        with torch.amp.autocast('cuda', enabled=False):
+            attention_weights = functional.softmax(
+                attention_logits.float(), dim=-1,
+            )
         attention_weights = attention_weights.nan_to_num(0.0)
 
         return attention_weights
@@ -313,9 +317,11 @@ class GAPLayer(nn.Module):
         )
 
         # Softmax over K neighbors: c_ij = softmax_j(logits_ij)
-        attention_coefficients = functional.softmax(
-            attention_logits, dim=-1,
-        )  # (B, 1, P, K)
+        # Force float32 to avoid precision loss under AMP autocast.
+        with torch.amp.autocast('cuda', enabled=False):
+            attention_coefficients = functional.softmax(
+                attention_logits.float(), dim=-1,
+            )  # (B, 1, P, K)
 
         # Handle all-masked case (NaN from softmax of all -inf)
         attention_coefficients = attention_coefficients.nan_to_num(0.0)
@@ -774,10 +780,7 @@ class TauTrackFinderV3(nn.Module):
             Scalar ranking loss. Zero if no GT tracks in the batch.
         """
         batch_size = predicted_logits.shape[0]
-        total_ranking_loss = torch.tensor(
-            0.0, device=predicted_logits.device, dtype=predicted_logits.dtype,
-        )
-        num_events_with_gt = 0
+        event_losses = []
 
         for event_index in range(batch_size):
             event_labels = target_labels[event_index]
@@ -796,8 +799,6 @@ class TauTrackFinderV3(nn.Module):
             if num_positives == 0 or num_negatives == 0:
                 continue
 
-            num_events_with_gt += 1
-
             # Sample S negatives per positive (with replacement if needed)
             num_samples = min(self.ranking_num_samples, num_negatives)
             sample_indices = torch.randint(
@@ -811,18 +812,22 @@ class TauTrackFinderV3(nn.Module):
             # Sampled negative scores: (1, num_samples)
             negative_scores = event_scores[sampled_negative_indices].unsqueeze(0)
 
-            # Pairwise ranking loss: log(1 + exp(neg - pos))
+            # Pairwise ranking loss: log(1 + exp(s_neg - s_pos))
+            # Numerically stable via softplus (handles overflow when |Δ| > 40)
             # Shape: (num_positives, num_samples)
-            pairwise_loss = torch.log1p(
-                torch.exp(negative_scores - positive_scores),
+            pairwise_loss = functional.softplus(
+                negative_scores - positive_scores,
             )
 
-            total_ranking_loss = total_ranking_loss + pairwise_loss.mean()
+            event_losses.append(pairwise_loss.mean())
 
-        if num_events_with_gt == 0:
-            return total_ranking_loss
+        if not event_losses:
+            return torch.tensor(
+                0.0, device=predicted_logits.device,
+                dtype=predicted_logits.dtype,
+            )
 
-        return total_ranking_loss / num_events_with_gt
+        return torch.stack(event_losses).mean()
 
     def forward(
         self,
@@ -936,6 +941,7 @@ class TauTrackFinderV3(nn.Module):
                 'total_loss': total_loss,
                 'per_track_loss': per_track_loss,
                 'ranking_loss': ranking_loss,
+                '_per_track_logits': per_track_logits,
             }
 
         # ---- Inference: return per-track logits ----
