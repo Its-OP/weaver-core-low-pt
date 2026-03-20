@@ -60,6 +60,9 @@ class TrackPreFilter(nn.Module):
         aggregation_mode: str = 'max',
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
+        use_isab: bool = False,
+        isab_num_inducing: int = 32,
+        isab_num_heads: int = 8,
     ):
         super().__init__()
         self.mode = mode
@@ -102,6 +105,12 @@ class TrackPreFilter(nn.Module):
         # >0 = also create negative copies with this sigma, must be rejected.
         self.contrastive_denoising_negative_sigma = contrastive_denoising_negative_sigma
 
+        # ISAB (Induced Set Attention Block, Lee et al. ICML 2019):
+        # Adds global event context after kNN rounds. m inducing points
+        # compress P tracks → m summaries → broadcast back to P tracks.
+        # Complexity: O(P·m·d) — linear in track count.
+        self.use_isab = use_isab
+
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
             self.lorentz_norm = nn.BatchNorm1d(4)
@@ -138,6 +147,29 @@ class TrackPreFilter(nn.Module):
                 )
                 for _ in range(num_message_rounds)
             ])
+            # ISAB: global context via induced set attention (Lee et al., ICML 2019).
+            # Encode: P tracks → m inducing points (cross-attention)
+            # Decode: m inducing points → P tracks (cross-attention)
+            # Every track receives information from the entire event.
+            if self.use_isab:
+                self.isab_layer_norm = nn.LayerNorm(hidden_dim)
+                # Encode: tracks attend to inducing points
+                self.isab_inducing_points = nn.Parameter(
+                    torch.randn(1, isab_num_inducing, hidden_dim) * 0.02,
+                )
+                self.isab_encode_attention = nn.MultiheadAttention(
+                    embed_dim=hidden_dim,
+                    num_heads=isab_num_heads,
+                    batch_first=True,
+                )
+                # Decode: tracks attend to encoded inducing points
+                self.isab_decode_attention = nn.MultiheadAttention(
+                    embed_dim=hidden_dim,
+                    num_heads=isab_num_heads,
+                    batch_first=True,
+                )
+                self.isab_output_norm = nn.LayerNorm(hidden_dim)
+
             # Scoring head
             self.scorer = nn.Sequential(
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
@@ -384,6 +416,42 @@ class TrackPreFilter(nn.Module):
                 aggregated = torch.cat([current, max_pooled], dim=1)
 
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
+
+        # ISAB: global context via induced set attention
+        # Encode: P tracks → m inducing points via cross-attention
+        # Decode: m inducing points → P tracks via cross-attention
+        # Uses residual connection: output = current + ISAB(current)
+        if self.use_isab:
+            # Conv1d format (B, C, P) → attention format (B, P, C)
+            current_seq = current.transpose(1, 2)
+            current_normed = self.isab_layer_norm(current_seq)
+
+            # Key padding mask for attention: True = ignored position
+            key_padding_mask = ~mask.squeeze(1).bool()  # (B, P)
+
+            # Encode: inducing points attend to tracks
+            # inducing_points (1, m, C) → expand to (B, m, C)
+            inducing = self.isab_inducing_points.expand(
+                current.shape[0], -1, -1,
+            )
+            encoded_inducing, _ = self.isab_encode_attention(
+                query=inducing,
+                key=current_normed,
+                value=current_normed,
+                key_padding_mask=key_padding_mask,
+            )  # (B, m, C)
+
+            # Decode: tracks attend to encoded inducing points
+            decoded_tracks, _ = self.isab_decode_attention(
+                query=current_normed,
+                key=encoded_inducing,
+                value=encoded_inducing,
+            )  # (B, P, C)
+
+            # Residual connection + norm, back to Conv1d format
+            current = (
+                current + self.isab_output_norm(decoded_tracks).transpose(1, 2)
+            ) * mask_float
 
         # Score
         scores = self.scorer(current).squeeze(1)  # (B, P)
