@@ -384,9 +384,10 @@ class TrackPreFilter(nn.Module):
                 spatial_coords = self.spatial_projections[round_index](current)
                 # (B, S, P) — learned coordinates
 
-                # Push padded tracks far away so they're never neighbors
+                # Push padded tracks far away so they're never neighbors.
+                # Use 1e4 (not 1e9) to stay within float16 range for AMP.
                 spatial_coords = spatial_coords.masked_fill(
-                    ~mask.bool().expand_as(spatial_coords), 1e9,
+                    ~mask.bool().expand_as(spatial_coords), 1e4,
                 )
 
                 # kNN in learned space (no_grad on indices, not on coords)
