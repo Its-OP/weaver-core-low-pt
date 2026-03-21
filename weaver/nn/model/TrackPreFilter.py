@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as functional
 
 from weaver.nn.model.HierarchicalGraphBackbone import cross_set_knn, cross_set_gather
+from weaver.nn.model.ParticleTransformer import pairwise_lv_fts
 
 
 class TrackPreFilter(nn.Module):
@@ -60,6 +61,7 @@ class TrackPreFilter(nn.Module):
         aggregation_mode: str = 'max',
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
+        use_pairwise_features: bool = False,
     ):
         super().__init__()
         self.mode = mode
@@ -102,6 +104,12 @@ class TrackPreFilter(nn.Module):
         # >0 = also create negative copies with this sigma, must be rejected.
         self.contrastive_denoising_negative_sigma = contrastive_denoising_negative_sigma
 
+        # EdgeConv pairwise features (ParticleNet/DGCNN-style + ParT LV features):
+        # Replaces gather-and-max-pool with h_ij = MLP(x_i ∥ x_j − x_i ∥ lv_fts ∥ charge_product).
+        # Adds 4 pairwise Lorentz-vector features (ln kT, ln z, ln ΔR, ln m²) plus
+        # charge product per edge. ParT ablation: removing pairwise drops 0.86 → 0.40.
+        self.use_pairwise_features = use_pairwise_features
+
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
             self.lorentz_norm = nn.BatchNorm1d(4)
@@ -124,7 +132,23 @@ class TrackPreFilter(nn.Module):
                 nn.ReLU(),
             )
             # Neighbor aggregation — repeated for each message round
-            if aggregation_mode == 'pna':
+            if use_pairwise_features:
+                # EdgeConv: edge_mlp processes (x_i ∥ x_j − x_i ∥ lv_fts ∥ charge_product)
+                # 4 LV pairwise features (ln kT, ln z, ln ΔR, ln m²) + 1 charge product
+                pairwise_feature_dim = 5
+                edge_input_dim = 2 * hidden_dim + pairwise_feature_dim
+                self.edge_mlps = nn.ModuleList([
+                    nn.Sequential(
+                        # Conv2d operates on (B, C, P, K) — per-edge transform
+                        nn.Conv2d(edge_input_dim, hidden_dim, kernel_size=1, bias=False),
+                        nn.BatchNorm2d(hidden_dim),
+                        nn.ReLU(),
+                    )
+                    for _ in range(num_message_rounds)
+                ])
+                # After max-pool of edge messages: (B, H, P) → neighbor_mlp
+                neighbor_input_dim = hidden_dim
+            elif aggregation_mode == 'pna':
                 # PNA: cat([current, mean, max, min, std]) = 5 * hidden_dim
                 neighbor_input_dim = 5 * hidden_dim
             else:
@@ -271,7 +295,7 @@ class TrackPreFilter(nn.Module):
             self._lorentz_cache = lorentz_vectors
 
         if self.mode == 'mlp':
-            scores = self._forward_mlp(points, features, mask)
+            scores = self._forward_mlp(points, features, lorentz_vectors, mask)
         elif self.mode == 'two_tower':
             scores = self._forward_two_tower(features, mask)
         elif self.mode == 'autoencoder':
@@ -338,6 +362,7 @@ class TrackPreFilter(nn.Module):
         self,
         points: torch.Tensor,
         features: torch.Tensor,
+        lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """Mode A: Per-track MLP with multi-round kNN neighborhood context."""
@@ -366,7 +391,62 @@ class TrackPreFilter(nn.Module):
                 mask.float(), neighbor_indices,
             )
 
-            if self.aggregation_mode == 'pna':
+            if self.use_pairwise_features:
+                # EdgeConv + pairwise LV features + charge product
+                # h_ij = edge_mlp(x_i ∥ x_j − x_i ∥ lv_fts ∥ q_i·q_j)
+                center_expanded = current.unsqueeze(-1).expand_as(
+                    neighbor_features,
+                )  # (B, H, P, K)
+                relative_features = neighbor_features - center_expanded
+
+                # Pairwise Lorentz-vector features: (B, 4, P, K)
+                # ln kT, ln z, ln ΔR, ln m² — physics-informed edge descriptors.
+                # .detach() + float32 to avoid NaN from sqrt(ΔR²) backward.
+                neighbor_lv = cross_set_gather(
+                    lorentz_vectors, neighbor_indices,
+                )  # (B, 4, P, K)
+                center_lv_expanded = lorentz_vectors.unsqueeze(-1).expand_as(
+                    neighbor_lv,
+                )
+                with torch.amp.autocast('cuda', enabled=False):
+                    lv_pair_features = pairwise_lv_fts(
+                        center_lv_expanded.detach().float(),
+                        neighbor_lv.detach().float(),
+                        num_outputs=4,
+                    )  # (B, 4, P, K)
+                lv_pair_features = lv_pair_features.to(current.dtype)
+
+                # Charge product: q_i · q_j (signal pairs have characteristic pattern)
+                # Charge is feature index 5 in the standardized input.
+                # We use the raw feature, not the embedding.
+                charge = features[:, 5:6, :]  # (B, 1, P)
+                neighbor_charge = cross_set_gather(
+                    charge, neighbor_indices,
+                )  # (B, 1, P, K)
+                charge_expanded = charge.unsqueeze(-1).expand_as(
+                    neighbor_charge,
+                )
+                charge_product = charge_expanded * neighbor_charge  # (B, 1, P, K)
+
+                # Concatenate edge features: (B, 2H+5, P, K)
+                edge_features = torch.cat([
+                    center_expanded,
+                    relative_features,
+                    lv_pair_features,
+                    charge_product,
+                ], dim=1)
+
+                # Edge MLP (Conv2d on P,K dims) → max-pool over K
+                messages = self.edge_mlps[round_index](edge_features)
+                messages = messages.masked_fill(
+                    neighbor_validity == 0, float('-inf'),
+                )
+                aggregated = messages.max(dim=-1)[0]  # (B, H, P)
+                aggregated = aggregated.masked_fill(
+                    aggregated == float('-inf'), 0.0,
+                )
+
+            elif self.aggregation_mode == 'pna':
                 # PNA: cat([current, mean, max, min, std]) → (B, 5*H, P)
                 pna_aggregated = self._pna_aggregate(
                     neighbor_features, neighbor_validity,
