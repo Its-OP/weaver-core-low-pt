@@ -60,6 +60,7 @@ class TrackPreFilter(nn.Module):
         aggregation_mode: str = 'max',
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
+        hard_negative_mining: bool = False,
     ):
         super().__init__()
         self.mode = mode
@@ -101,6 +102,12 @@ class TrackPreFilter(nn.Module):
         # 0.0 = disabled (positive copies only, current behavior).
         # >0 = also create negative copies with this sigma, must be rejected.
         self.contrastive_denoising_negative_sigma = contrastive_denoising_negative_sigma
+
+        # OHEM (Shrivastava et al., CVPR 2016):
+        # Select the K highest-scoring negatives instead of random sampling.
+        # Forces the model to focus on the decision boundary (hard negatives)
+        # rather than wasting gradients on trivially easy noise tracks.
+        self.hard_negative_mining = hard_negative_mining
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
@@ -615,11 +622,21 @@ class TrackPreFilter(nn.Module):
                 continue
 
             num_samples = min(self.ranking_num_samples, len(negative_indices))
-            sample_idx = torch.randint(
-                0, len(negative_indices), (num_samples,),
-                device=scores.device,
-            )
-            sampled_negatives = negative_indices[sample_idx]
+
+            if self.hard_negative_mining:
+                # OHEM: select the K highest-scoring negatives (hardest examples).
+                # These are the noise tracks closest to the decision boundary —
+                # the ones the model is most confused about.
+                negative_scores_all = event_scores[negative_indices]
+                _, topk_idx = negative_scores_all.topk(num_samples)
+                sampled_negatives = negative_indices[topk_idx]
+            else:
+                # Random sampling (default)
+                sample_idx = torch.randint(
+                    0, len(negative_indices), (num_samples,),
+                    device=scores.device,
+                )
+                sampled_negatives = negative_indices[sample_idx]
 
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
