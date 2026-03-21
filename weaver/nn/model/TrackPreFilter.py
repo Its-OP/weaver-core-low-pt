@@ -60,6 +60,9 @@ class TrackPreFilter(nn.Module):
         aggregation_mode: str = 'max',
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
+        supmin_weight: float = 0.0,
+        supmin_projection_dim: int = 64,
+        supmin_temperature: float = 0.1,
     ):
         super().__init__()
         self.mode = mode
@@ -101,6 +104,14 @@ class TrackPreFilter(nn.Module):
         # 0.0 = disabled (positive copies only, current behavior).
         # >0 = also create negative copies with this sigma, must be rejected.
         self.contrastive_denoising_negative_sigma = contrastive_denoising_negative_sigma
+
+        # SupMin contrastive auxiliary loss (Mildenberger et al., CVPR 2025):
+        # 0.0 = disabled. >0 = weight of auxiliary contrastive loss.
+        # Applies SupCon on signal tracks (pull together) and NT-Xent
+        # on noise tracks (spread uniformly). Shapes the embedding space
+        # so signal forms a tight cluster, making the scorer's job easier.
+        self.supmin_weight = supmin_weight
+        self.supmin_temperature = supmin_temperature
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
@@ -145,6 +156,15 @@ class TrackPreFilter(nn.Module):
                 nn.ReLU(),
                 nn.Conv1d(hidden_dim, 1, kernel_size=1),
             )
+            # SupMin projector: maps pre-scorer embeddings to contrastive space.
+            # L2-normalized outputs live on a hypersphere where SupCon operates.
+            if supmin_weight > 0:
+                self.supmin_projector = nn.Sequential(
+                    nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(),
+                    nn.Conv1d(hidden_dim, supmin_projection_dim, kernel_size=1),
+                )
 
         elif mode == 'two_tower':
             # Track tower
@@ -384,6 +404,9 @@ class TrackPreFilter(nn.Module):
                 aggregated = torch.cat([current, max_pooled], dim=1)
 
             current = self.neighbor_mlps[round_index](aggregated) * mask_float
+
+        # Cache pre-scorer embedding for SupMin contrastive loss
+        self._embedding_cache = current
 
         # Score
         scores = self.scorer(current).squeeze(1)  # (B, P)
@@ -651,6 +674,115 @@ class TrackPreFilter(nn.Module):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
         return torch.stack(event_losses).mean()
 
+    def _supmin_loss(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Supervised Minority contrastive loss (Mildenberger et al., CVPR 2025).
+
+        Signal tracks: SupCon — pull all signal embeddings in the event together.
+        Noise tracks: NT-Xent uniformity — spread noise embeddings on the hypersphere.
+
+        Operates per-event to handle variable GT counts.
+
+        Args:
+            embeddings: (B, hidden_dim, P) pre-scorer track embeddings.
+            labels: (B, P) binary labels (1 = signal).
+            valid_mask: (B, P) boolean validity mask.
+        """
+        # Project to contrastive space and L2-normalize onto hypersphere
+        projected = self.supmin_projector(embeddings)  # (B, projection_dim, P)
+        # (B, projection_dim, P) → (B, P, projection_dim)
+        projected = projected.transpose(1, 2)
+        projected = functional.normalize(projected, dim=2)
+
+        temperature = self.supmin_temperature
+        batch_size = embeddings.shape[0]
+        event_losses = []
+
+        for event_index in range(batch_size):
+            event_valid = valid_mask[event_index]
+            event_labels = labels[event_index]
+            event_embeddings = projected[event_index]  # (P, D)
+
+            signal_indices = (
+                (event_labels == 1.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+            noise_indices = (
+                (event_labels == 0.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+
+            # SupCon on signal: each signal track's loss pulls it toward
+            # other signal tracks relative to all tracks in the event.
+            # L = -1/(|S|-1) * sum_{j in S, j!=i} log(
+            #     exp(sim(i,j)/τ) / sum_{k != i} exp(sim(i,k)/τ))
+            if len(signal_indices) >= 2:
+                signal_embeddings = event_embeddings[signal_indices]  # (S, D)
+                # Similarity matrix among signal + sampled noise
+                num_noise_samples = min(50, len(noise_indices))
+                if num_noise_samples > 0:
+                    noise_sample_idx = torch.randint(
+                        0, len(noise_indices), (num_noise_samples,),
+                        device=embeddings.device,
+                    )
+                    noise_embeddings = event_embeddings[
+                        noise_indices[noise_sample_idx]
+                    ]
+                    # All anchors: signal. All candidates: signal + noise.
+                    all_candidates = torch.cat(
+                        [signal_embeddings, noise_embeddings], dim=0,
+                    )  # (S + N_sample, D)
+                else:
+                    all_candidates = signal_embeddings
+
+                num_signal = len(signal_indices)
+                # sim(i, j) for signal anchors vs all candidates
+                # signal_embeddings: (S, D), all_candidates: (S+N, D)
+                similarity = torch.mm(
+                    signal_embeddings, all_candidates.t(),
+                ) / temperature  # (S, S+N)
+
+                # Mask: for each signal anchor i, positives are other signal
+                # tracks (indices 0..S-1 excluding i)
+                positive_mask = torch.zeros_like(similarity, dtype=torch.bool)
+                for i in range(num_signal):
+                    for j in range(num_signal):
+                        if i != j:
+                            positive_mask[i, j] = True
+
+                # Self-mask: exclude self-similarity from denominator
+                self_mask = torch.ones_like(similarity, dtype=torch.bool)
+                for i in range(num_signal):
+                    self_mask[i, i] = False
+
+                # Log-sum-exp denominator (over non-self candidates)
+                denominator = torch.logsumexp(
+                    similarity.masked_fill(~self_mask, float('-inf')),
+                    dim=1,
+                )  # (S,)
+
+                # Numerator: mean log-prob of positive pairs
+                if positive_mask.any():
+                    # For each anchor, average over its positive pairs
+                    supcon_loss_per_anchor = []
+                    for i in range(num_signal):
+                        positive_sims = similarity[i][positive_mask[i]]
+                        if len(positive_sims) > 0:
+                            # -mean(sim_pos - logsumexp_all)
+                            supcon_loss_per_anchor.append(
+                                -(positive_sims - denominator[i]).mean()
+                            )
+                    if supcon_loss_per_anchor:
+                        event_losses.append(
+                            torch.stack(supcon_loss_per_anchor).mean()
+                        )
+
+        if not event_losses:
+            return torch.tensor(0.0, device=embeddings.device, dtype=embeddings.dtype)
+        return torch.stack(event_losses).mean()
+
     def compute_loss(
         self,
         points: torch.Tensor,
@@ -680,6 +812,15 @@ class TrackPreFilter(nn.Module):
         loss_dict = {
             'ranking_loss': ranking_loss,
         }
+
+        # SupMin contrastive auxiliary loss: shapes embedding space so
+        # signal tracks cluster tightly, noise spreads uniformly.
+        if self.supmin_weight > 0 and self.training and hasattr(self, '_embedding_cache'):
+            supmin_loss = self._supmin_loss(
+                self._embedding_cache, labels_flat, valid_mask,
+            )
+            total_loss = total_loss + self.supmin_weight * supmin_loss
+            loss_dict['supmin_loss'] = supmin_loss
 
         # Contrastive denoising: run forward on feature-noised GT copies
         if use_contrastive_denoising and self.training:
