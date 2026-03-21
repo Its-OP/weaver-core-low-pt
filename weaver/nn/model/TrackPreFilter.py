@@ -60,6 +60,8 @@ class TrackPreFilter(nn.Module):
         aggregation_mode: str = 'max',
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
+        use_gravnet: bool = False,
+        gravnet_space_dim: int = 4,
     ):
         super().__init__()
         self.mode = mode
@@ -102,6 +104,13 @@ class TrackPreFilter(nn.Module):
         # >0 = also create negative copies with this sigma, must be rejected.
         self.contrastive_denoising_negative_sigma = contrastive_denoising_negative_sigma
 
+        # GravNet (Qasim et al., Eur. Phys. J. C 2019):
+        # Replaces fixed (η,φ) kNN with kNN in a learned S-dim space.
+        # Signal tracks can be mapped close together → signal-enriched neighborhoods.
+        # Distance-weighted aggregation: w_ij = exp(-||s_i - s_j||²).
+        self.use_gravnet = use_gravnet
+        self.gravnet_space_dim = gravnet_space_dim
+
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
             self.lorentz_norm = nn.BatchNorm1d(4)
@@ -123,8 +132,16 @@ class TrackPreFilter(nn.Module):
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
             )
+            # GravNet: spatial projection + distance-weighted aggregation per round
+            if use_gravnet:
+                self.spatial_projections = nn.ModuleList([
+                    nn.Conv1d(hidden_dim, gravnet_space_dim, kernel_size=1)
+                    for _ in range(num_message_rounds)
+                ])
+                # GravNet aggregates: cat([current, weighted_mean, weighted_max])
+                neighbor_input_dim = 3 * hidden_dim
             # Neighbor aggregation — repeated for each message round
-            if aggregation_mode == 'pna':
+            elif aggregation_mode == 'pna':
                 # PNA: cat([current, mean, max, min, std]) = 5 * hidden_dim
                 neighbor_input_dim = 5 * hidden_dim
             else:
@@ -346,33 +363,104 @@ class TrackPreFilter(nn.Module):
         # Per-track embedding
         track_embedding = self.track_mlp(features) * mask_float  # (B, H, P)
 
-        # kNN indices in (eta, phi), computed once and reused across rounds
-        with torch.no_grad():
-            neighbor_indices = cross_set_knn(
-                query_coordinates=points,
-                reference_coordinates=points,
-                num_neighbors=self.num_neighbors,
-                reference_mask=mask,
-                query_reference_indices=None,
-            )
+        # kNN indices: fixed (η,φ) for standard mode, or learned space for GravNet
+        if not self.use_gravnet:
+            with torch.no_grad():
+                neighbor_indices = cross_set_knn(
+                    query_coordinates=points,
+                    reference_coordinates=points,
+                    num_neighbors=self.num_neighbors,
+                    reference_mask=mask,
+                    query_reference_indices=None,
+                )
 
         # Multi-round message passing
         current = track_embedding
         for round_index in range(self.num_message_rounds):
-            neighbor_features = cross_set_gather(
-                current, neighbor_indices,
-            )
-            neighbor_validity = cross_set_gather(
-                mask.float(), neighbor_indices,
-            )
 
-            if self.aggregation_mode == 'pna':
+            if self.use_gravnet:
+                # GravNet: project to learned S-dim space, build kNN there.
+                # Each round gets its own projection — the space evolves.
+                spatial_coords = self.spatial_projections[round_index](current)
+                # (B, S, P) — learned coordinates
+
+                # Push padded tracks far away so they're never neighbors
+                spatial_coords = spatial_coords.masked_fill(
+                    ~mask.bool().expand_as(spatial_coords), 1e9,
+                )
+
+                # kNN in learned space (no_grad on indices, not on coords)
+                with torch.no_grad():
+                    neighbor_indices = cross_set_knn(
+                        query_coordinates=spatial_coords.detach(),
+                        reference_coordinates=spatial_coords.detach(),
+                        num_neighbors=self.num_neighbors,
+                        reference_mask=mask,
+                        query_reference_indices=None,
+                    )
+
+                # Gather neighbor features and spatial coords
+                neighbor_features = cross_set_gather(
+                    current, neighbor_indices,
+                )  # (B, H, P, K)
+                neighbor_validity = cross_set_gather(
+                    mask.float(), neighbor_indices,
+                )  # (B, 1, P, K)
+                neighbor_spatial = cross_set_gather(
+                    spatial_coords, neighbor_indices,
+                )  # (B, S, P, K)
+
+                # Distance-weighted aggregation: w_ij = exp(-||s_i - s_j||²)
+                # Gaussian weighting — closer in learned space contributes more.
+                center_spatial = spatial_coords.unsqueeze(-1).expand_as(
+                    neighbor_spatial,
+                )  # (B, S, P, K)
+                squared_distances = (
+                    (center_spatial - neighbor_spatial).pow(2).sum(dim=1, keepdim=True)
+                )  # (B, 1, P, K)
+                weights = torch.exp(-squared_distances) * neighbor_validity
+                # (B, 1, P, K)
+
+                # Weighted mean: Σ(w_ij * h_j) / Σ(w_ij)
+                weight_sum = weights.sum(dim=-1).clamp(min=1e-6)  # (B, 1, P)
+                weighted_mean = (
+                    (neighbor_features * weights).sum(dim=-1) / weight_sum
+                )  # (B, H, P)
+
+                # Weighted max: max_j(w_ij * h_j)
+                weighted_features = neighbor_features * weights
+                weighted_features = weighted_features.masked_fill(
+                    neighbor_validity == 0, float('-inf'),
+                )
+                weighted_max = weighted_features.max(dim=-1)[0]
+                weighted_max = weighted_max.masked_fill(
+                    weighted_max == float('-inf'), 0.0,
+                )
+
+                # cat([current, weighted_mean, weighted_max]) → (B, 3H, P)
+                aggregated = torch.cat(
+                    [current, weighted_mean, weighted_max], dim=1,
+                )
+
+            elif self.aggregation_mode == 'pna':
+                neighbor_features = cross_set_gather(
+                    current, neighbor_indices,
+                )
+                neighbor_validity = cross_set_gather(
+                    mask.float(), neighbor_indices,
+                )
                 # PNA: cat([current, mean, max, min, std]) → (B, 5*H, P)
                 pna_aggregated = self._pna_aggregate(
                     neighbor_features, neighbor_validity,
                 )
                 aggregated = torch.cat([current, pna_aggregated], dim=1)
             else:
+                neighbor_features = cross_set_gather(
+                    current, neighbor_indices,
+                )
+                neighbor_validity = cross_set_gather(
+                    mask.float(), neighbor_indices,
+                )
                 # Standard max-pool: cat([current, max_pooled]) → (B, 2*H, P)
                 neighbor_features = neighbor_features.masked_fill(
                     neighbor_validity == 0, float('-inf'),
