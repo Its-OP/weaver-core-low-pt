@@ -62,6 +62,8 @@ class TrackPreFilter(nn.Module):
         contrastive_denoising_negative_sigma: float = 0.0,
         use_gravnet: bool = False,
         gravnet_space_dim: int = 4,
+        gravnet_distance_loss_weight: float = 0.0,
+        gravnet_distance_loss_margin: float = 1.0,
     ):
         super().__init__()
         self.mode = mode
@@ -110,6 +112,8 @@ class TrackPreFilter(nn.Module):
         # Distance-weighted aggregation: w_ij = exp(-||s_i - s_j||²).
         self.use_gravnet = use_gravnet
         self.gravnet_space_dim = gravnet_space_dim
+        self.gravnet_distance_loss_weight = gravnet_distance_loss_weight
+        self.gravnet_distance_loss_margin = gravnet_distance_loss_margin
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
@@ -383,6 +387,8 @@ class TrackPreFilter(nn.Module):
                 # Each round gets its own projection — the space evolves.
                 spatial_coords = self.spatial_projections[round_index](current)
                 # (B, S, P) — learned coordinates
+                # Cache last round's coords for distance loss
+                self._gravnet_spatial_cache = spatial_coords
 
                 # Push padded tracks far away so they're never neighbors.
                 # Use 1e4 (not 1e9) to stay within float16 range for AMP.
@@ -740,6 +746,91 @@ class TrackPreFilter(nn.Module):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
         return torch.stack(event_losses).mean()
 
+    def _gravnet_distance_loss(
+        self,
+        spatial_coords: torch.Tensor,
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Metric learning loss on GravNet's learned coordinate space.
+
+        Pulls GT signal tracks together and pushes noise tracks away,
+        giving the spatial projection a direct learning signal for
+        clustering signal tracks as neighbors.
+
+        Inspired by the Exa.TrkX metric learning step (Ju et al., 2021).
+
+        Args:
+            spatial_coords: (B, S, P) learned spatial coordinates.
+            labels: (B, P) binary labels.
+            valid_mask: (B, P) boolean mask.
+
+        L = attraction + repulsion
+        attraction = mean ||s_i - s_j||² for GT pairs (i,j)
+        repulsion  = mean max(0, margin - ||s_i - s_j||)² for (GT i, noise j)
+        """
+        margin = self.gravnet_distance_loss_margin
+        batch_size = spatial_coords.shape[0]
+        event_losses = []
+
+        for event_index in range(batch_size):
+            event_coords = spatial_coords[event_index]  # (S, P)
+            event_labels = labels[event_index]
+            event_valid = valid_mask[event_index]
+
+            signal_indices = (
+                (event_labels == 1.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+            noise_indices = (
+                (event_labels == 0.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+
+            if len(signal_indices) < 2 or len(noise_indices) == 0:
+                continue
+
+            signal_coords = event_coords[:, signal_indices]  # (S, num_gt)
+
+            # Attraction: pull all GT pairs together
+            # ||s_i - s_j||² for all pairs of GT tracks
+            num_gt = len(signal_indices)
+            attraction = torch.tensor(0.0, device=spatial_coords.device)
+            pair_count = 0
+            for i in range(num_gt):
+                for j in range(i + 1, num_gt):
+                    distance_squared = (
+                        signal_coords[:, i] - signal_coords[:, j]
+                    ).pow(2).sum()
+                    attraction = attraction + distance_squared
+                    pair_count += 1
+            if pair_count > 0:
+                attraction = attraction / pair_count
+
+            # Repulsion: push sampled noise away from GT centroid
+            # max(0, margin - ||s_gt - s_noise||)²
+            gt_centroid = signal_coords.mean(dim=1)  # (S,)
+            num_noise_samples = min(50, len(noise_indices))
+            noise_sample_idx = torch.randperm(
+                len(noise_indices), device=spatial_coords.device,
+            )[:num_noise_samples]
+            sampled_noise_coords = event_coords[
+                :, noise_indices[noise_sample_idx]
+            ]  # (S, num_samples)
+
+            # Distance from each noise track to GT centroid
+            noise_distances = (
+                sampled_noise_coords - gt_centroid.unsqueeze(1)
+            ).pow(2).sum(dim=0).sqrt()  # (num_samples,)
+
+            repulsion = functional.relu(margin - noise_distances).pow(2).mean()
+
+            event_losses.append(attraction + repulsion)
+
+        if not event_losses:
+            return torch.tensor(
+                0.0, device=spatial_coords.device, dtype=spatial_coords.dtype,
+            )
+        return torch.stack(event_losses).mean()
+
     def compute_loss(
         self,
         points: torch.Tensor,
@@ -769,6 +860,18 @@ class TrackPreFilter(nn.Module):
         loss_dict = {
             'ranking_loss': ranking_loss,
         }
+
+        # GravNet distance loss: attract GT pairs, repel noise in learned space.
+        # Gives the spatial projection direct signal for clustering.
+        if (self.use_gravnet
+                and self.gravnet_distance_loss_weight > 0
+                and self.training
+                and hasattr(self, '_gravnet_spatial_cache')):
+            gravnet_loss = self._gravnet_distance_loss(
+                self._gravnet_spatial_cache, labels_flat, valid_mask,
+            )
+            total_loss = total_loss + self.gravnet_distance_loss_weight * gravnet_loss
+            loss_dict['gravnet_distance_loss'] = gravnet_loss
 
         # Contrastive denoising: run forward on feature-noised GT copies
         if use_contrastive_denoising and self.training:
