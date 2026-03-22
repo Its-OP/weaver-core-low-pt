@@ -60,6 +60,12 @@ class TrackPreFilter(nn.Module):
         aggregation_mode: str = 'max',
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
+        # RS@K surrogate loss (Patel et al., CVPR 2022, arXiv:2108.11179):
+        rs_at_k_weight_start: float = 0.0,
+        rs_at_k_weight_end: float = 0.0,
+        rs_at_k_target: int = 200,
+        rs_at_k_tau1: float = 1.0,
+        rs_at_k_tau2: float = 1.0,
     ):
         super().__init__()
         self.mode = mode
@@ -101,6 +107,18 @@ class TrackPreFilter(nn.Module):
         # 0.0 = disabled (positive copies only, current behavior).
         # >0 = also create negative copies with this sigma, must be rejected.
         self.contrastive_denoising_negative_sigma = contrastive_denoising_negative_sigma
+
+        # RS@K surrogate loss (Patel et al., CVPR 2022, arXiv:2108.11179):
+        # Differentiable approximation to Recall@K via nested sigmoid relaxations.
+        # Weight anneals from rs_at_k_weight_start → rs_at_k_weight_end
+        # using the same _temperature_progress schedule as ranking temperature.
+        # τ₁ controls outer sigmoid sharpness (top-K indicator).
+        # τ₂ controls inner sigmoid sharpness (pairwise rank estimation).
+        self.rs_at_k_weight_start = rs_at_k_weight_start
+        self.rs_at_k_weight_end = rs_at_k_weight_end
+        self.rs_at_k_target = rs_at_k_target
+        self.rs_at_k_tau1 = rs_at_k_tau1
+        self.rs_at_k_tau2 = rs_at_k_tau2
 
         # Lorentz vector normalization (if used)
         if use_lorentz_vectors:
@@ -558,6 +576,18 @@ class TrackPreFilter(nn.Module):
             * (self.ranking_temperature_end - self.ranking_temperature_start)
         )
 
+    @property
+    def current_rs_at_k_weight(self) -> float:
+        """Current RS@K loss weight, interpolated by progress.
+
+        weight(t) = weight_start + t × (weight_end - weight_start)
+        """
+        return (
+            self.rs_at_k_weight_start
+            + self._temperature_progress
+            * (self.rs_at_k_weight_end - self.rs_at_k_weight_start)
+        )
+
     def set_drw_active(self, active: bool) -> None:
         """Activate/deactivate Deferred Re-Weighting of positive samples.
 
@@ -651,6 +681,81 @@ class TrackPreFilter(nn.Module):
             return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
         return torch.stack(event_losses).mean()
 
+    def _rs_at_k_loss(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Recall-Surrogate@K loss (Patel et al., CVPR 2022, arXiv:2108.11179).
+
+        Differentiable approximation to Recall@K via two nested sigmoid
+        relaxations:
+
+            soft_rank_p = sum_{n ∈ negatives} σ(τ₂⁻¹ · (s_n - s_p))
+            RS@K = (1/|P|) · sum_{p ∈ positives} σ(τ₁⁻¹ · (K - soft_rank_p))
+
+        Loss = 1 - RS@K  (minimized when all positives are in top-K).
+
+        Inner sigmoid σ(τ₂⁻¹ · (s_n - s_p)):
+            Estimates how many negatives score above positive p.
+            Each term ≈ 1 when s_n > s_p, ≈ 0 when s_n < s_p.
+            Sum over negatives = soft rank of positive p.
+
+        Outer sigmoid σ(τ₁⁻¹ · (K - soft_rank)):
+            ≈ 1 when soft_rank < K (positive is within top-K),
+            ≈ 0 when soft_rank > K (positive is outside top-K).
+
+        Args:
+            scores: (B, P) per-track scores.
+            labels: (B, P) binary labels (1.0 = GT, 0.0 = background).
+            valid_mask: (B, P) boolean mask for valid tracks.
+
+        Returns:
+            Scalar loss = 1 - RS@K, averaged over batch.
+        """
+        batch_size = scores.shape[0]
+        target_k = self.rs_at_k_target
+        tau1 = self.rs_at_k_tau1
+        tau2 = self.rs_at_k_tau2
+        event_losses = []
+
+        for event_index in range(batch_size):
+            event_scores = scores[event_index]
+            event_labels = labels[event_index]
+            event_valid = valid_mask[event_index]
+
+            positive_indices = (
+                (event_labels == 1.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+            negative_indices = (
+                (event_labels == 0.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+
+            if len(positive_indices) == 0 or len(negative_indices) == 0:
+                continue
+
+            positive_scores = event_scores[positive_indices]   # (num_pos,)
+            negative_scores = event_scores[negative_indices]   # (num_neg,)
+
+            # soft_rank_p = sum_n σ(τ₂⁻¹ · (s_n - s_p))
+            # Shape: (num_pos, num_neg)
+            score_differences = (
+                negative_scores.unsqueeze(0) - positive_scores.unsqueeze(1)
+            )
+            soft_rank = torch.sigmoid(score_differences / tau2).sum(dim=1)
+
+            # RS@K = (1/|P|) · sum_p σ(τ₁⁻¹ · (K - soft_rank_p))
+            in_top_k = torch.sigmoid((target_k - soft_rank) / tau1)
+            rs_at_k = in_top_k.mean()
+
+            # Loss = 1 - RS@K (minimize to maximize recall)
+            event_losses.append(1.0 - rs_at_k)
+
+        if not event_losses:
+            return torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+        return torch.stack(event_losses).mean()
+
     def compute_loss(
         self,
         points: torch.Tensor,
@@ -680,6 +785,14 @@ class TrackPreFilter(nn.Module):
         loss_dict = {
             'ranking_loss': ranking_loss,
         }
+
+        # RS@K surrogate loss (Patel et al., CVPR 2022):
+        # L_total = L_ranking + weight(t) × L_RS@K
+        rs_at_k_weight = self.current_rs_at_k_weight
+        if rs_at_k_weight > 0:
+            rs_at_k_loss = self._rs_at_k_loss(scores, labels_flat, valid_mask)
+            total_loss = total_loss + rs_at_k_weight * rs_at_k_loss
+            loss_dict['rs_at_k_loss'] = rs_at_k_loss
 
         # Contrastive denoising: run forward on feature-noised GT copies
         if use_contrastive_denoising and self.training:
