@@ -150,8 +150,16 @@ class CascadeReranker(nn.Module):
         # Pairwise attention bias from Lorentz vectors:
         # PairEmbed computes ln kT, ln z, ln ΔR, ln m² for all pairs
         # and projects to (B, num_heads, K1, K1) → reshape to (B*H, K1, K1)
+        #
+        # .detach() prevents NaN gradients from pairwise_lv_fts():
+        # sqrt(ΔR²) has gradient 0.5/sqrt(0) = inf for self-pairs (ΔR=0).
+        # Pairwise features are physics constants used as attention bias —
+        # they don't need gradients w.r.t. input 4-vectors.
+        # .float() ensures float32 precision for the ln/sqrt operations
+        # even when AMP casts the rest to float16.
+        lorentz_for_pairs = (lorentz_vectors * mask_float).detach().float()
         attention_bias = self.pair_embed(
-            lorentz_vectors * mask_float, uu=None,
+            lorentz_for_pairs, uu=None,
         )  # (B, num_heads, K1, K1)
         num_heads = attention_bias.shape[1]
         attention_bias = attention_bias.view(
