@@ -135,8 +135,13 @@ class CascadeReranker(nn.Module):
         padding_mask = ~valid_mask  # (B, K1) — True for padded positions
         mask_float = mask.float()
 
-        # Concatenate stage1 scores as an extra feature channel
-        stage1_channel = stage1_scores.unsqueeze(1)  # (B, 1, K1)
+        # Concatenate stage1 scores as an extra feature channel.
+        # Replace -inf (padded tracks from select_top_k) with 0 before
+        # multiplication — (-inf * 0.0 = NaN) in float arithmetic.
+        safe_stage1_scores = stage1_scores.masked_fill(
+            ~valid_mask, 0.0,
+        )
+        stage1_channel = safe_stage1_scores.unsqueeze(1)  # (B, 1, K1)
         combined_features = torch.cat(
             [features, stage1_channel], dim=1,
         ) * mask_float  # (B, input_dim+1, K1)
