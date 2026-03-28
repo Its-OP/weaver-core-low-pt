@@ -47,9 +47,16 @@ class CascadeModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Run frozen Stage 1 and select top-K1 tracks.
 
-        Returns dict with filtered tensors (B, C, K1) and stage1_scores (B, K1).
+        Returns dict with filtered tensors (B, C, K1), stage1_scores (B, K1),
+        and selected_indices (B, K1) mapping back to full-event positions.
         """
-        self.stage1.eval()
+        # Use train() mode for Stage 1: its BatchNorm running statistics are
+        # stale because the pre-filter training loop ran validation in train()
+        # mode (train_prefilter.py:239), corrupting running_mean/running_var.
+        # With eval() mode, R@600 drops from 0.90 to 0.70, capping the cascade.
+        # train() mode uses batch statistics which match training conditions.
+        # @torch.no_grad() already prevents gradient computation and param updates.
+        self.stage1.train()
 
         # Score all tracks
         scores = self.stage1(points, features, lorentz_vectors, mask)
@@ -71,6 +78,7 @@ class CascadeModel(nn.Module):
             'lorentz_vectors': gather_tracks(lorentz_vectors, selected_indices),
             'mask': gather_tracks(mask, selected_indices),
             'stage1_scores': stage1_scores,
+            'selected_indices': selected_indices,
         }
         if track_labels is not None:
             result['track_labels'] = gather_tracks(track_labels, selected_indices)
