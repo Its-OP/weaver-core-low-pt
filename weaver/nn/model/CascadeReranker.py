@@ -60,7 +60,6 @@ class CascadeReranker(nn.Module):
         ranking_num_samples: int = 50,
         ranking_temperature: float = 1.0,
         loss_mode: str = 'pairwise',
-        boundary_sampling: bool = False,
         rs_at_k_target: int = 200,
         rs_at_k_tau1: float = 1.0,
         rs_at_k_tau2: float = 1.0,
@@ -70,7 +69,6 @@ class CascadeReranker(nn.Module):
         self.ranking_temperature = ranking_temperature
         self.pair_extra_dim = pair_extra_dim
         self.loss_mode = loss_mode
-        self.boundary_sampling = boundary_sampling
         self.rs_at_k_target = rs_at_k_target
         self.rs_at_k_tau1 = rs_at_k_tau1
         self.rs_at_k_tau2 = rs_at_k_tau2
@@ -430,40 +428,12 @@ class CascadeReranker(nn.Module):
             if len(positive_indices) == 0 or len(negative_indices) == 0:
                 continue
 
-            # Negative sampling: boundary-focused or random
-            if self.boundary_sampling:
-                masked_scores = event_scores.clone()
-                masked_scores[~event_valid] = float('-inf')
-                ranks = torch.argsort(
-                    torch.argsort(masked_scores, descending=True),
-                )
-                neg_ranks = ranks[negative_indices]
-                boundary_mask = (
-                    (neg_ranks >= max(0, k_boundary - 50))
-                    & (neg_ranks < k_boundary + 50)
-                )
-                if boundary_mask.any():
-                    boundary_neg = negative_indices[boundary_mask]
-                    num_samples = min(self.ranking_num_samples, len(boundary_neg))
-                    sample_idx = torch.randint(
-                        0, len(boundary_neg), (num_samples,),
-                        device=scores.device,
-                    )
-                    sampled_negatives = boundary_neg[sample_idx]
-                else:
-                    num_samples = min(self.ranking_num_samples, len(negative_indices))
-                    sample_idx = torch.randint(
-                        0, len(negative_indices), (num_samples,),
-                        device=scores.device,
-                    )
-                    sampled_negatives = negative_indices[sample_idx]
-            else:
-                num_samples = min(self.ranking_num_samples, len(negative_indices))
-                sample_idx = torch.randint(
-                    0, len(negative_indices), (num_samples,),
-                    device=scores.device,
-                )
-                sampled_negatives = negative_indices[sample_idx]
+            num_samples = min(self.ranking_num_samples, len(negative_indices))
+            sample_idx = torch.randint(
+                0, len(negative_indices), (num_samples,),
+                device=scores.device,
+            )
+            sampled_negatives = negative_indices[sample_idx]
 
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
