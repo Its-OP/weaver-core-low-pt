@@ -83,10 +83,10 @@ class CascadeReranker(nn.Module):
         if pair_embed_dims is None:
             pair_embed_dims = [64, 64]
 
-        # Input embedding: cat(features, stage1_score) → embed_dim
-        # +1 for stage1_score channel
+        # Input embedding: cat(features, stage1_score, z_pt) → embed_dim
+        # +1 for stage1_score, +1 for energy sharing fraction z_pt
         self.embed = Embed(
-            input_dim + 1,
+            input_dim + 2,
             dims=[embed_dim],
             normalize_input=True,
         )
@@ -169,9 +169,19 @@ class CascadeReranker(nn.Module):
             ~valid_mask, 0.0,
         )
         stage1_channel = safe_stage1_scores.unsqueeze(1)  # (B, 1, K1)
+
+        # Energy sharing fraction: z_i = pT_i / sum(pT) per event.
+        # Tau daughters have characteristic z distributions from the
+        # a1→rho+pi decay (correlated momentum sharing).
+        px_track = lorentz_vectors[:, 0:1, :]  # (B, 1, K1)
+        py_track = lorentz_vectors[:, 1:2, :]  # (B, 1, K1)
+        pt_track = torch.sqrt(px_track ** 2 + py_track ** 2)  # (B, 1, K1)
+        sum_pt = (pt_track * mask_float).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        z_pt = (pt_track / sum_pt) * mask_float  # (B, 1, K1)
+
         combined_features = torch.cat(
-            [features, stage1_channel], dim=1,
-        ) * mask_float  # (B, input_dim+1, K1)
+            [features, stage1_channel, z_pt], dim=1,
+        ) * mask_float  # (B, input_dim+2, K1)
 
         # Input embedding: (B, C, K1) → (K1, B, embed_dim)
         track_embeddings = self.embed(combined_features)
@@ -308,13 +318,24 @@ class CascadeReranker(nn.Module):
         # Clamp to avoid division by zero for nearly parallel tracks
         dxy_phi_corrected = dxy_diff / (2.0 * sin_half_dphi).clamp(min=0.05)
 
-        # Stack and mask: (B, 5, K1, K1)
+        # --- Channel 6: Minkowski dot product p_i · p_j ---
+        # PELICAN (arXiv) shows pairwise Lorentz dot products alone match ParT.
+        # p_i · p_j = E_i*E_j - px_i*px_j - py_i*py_j - pz_i*pz_j
+        lorentz_dot = (
+            energy.unsqueeze(-1) * energy.unsqueeze(-2)
+            - px.unsqueeze(-1) * px.unsqueeze(-2)
+            - py.unsqueeze(-1) * py.unsqueeze(-2)
+            - pz.unsqueeze(-1) * pz.unsqueeze(-2)
+        )  # (B, 1, K1, K1)
+
+        # Stack and mask: (B, 6, K1, K1)
         extra_pairwise = torch.cat([
             charge_product,
             dz_diff,
             rho_indicator,
             rho_os_indicator,
             dxy_phi_corrected,
+            lorentz_dot,
         ], dim=1) * pair_mask
 
         return extra_pairwise
