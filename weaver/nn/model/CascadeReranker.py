@@ -205,6 +205,14 @@ class CascadeReranker(nn.Module):
         extra_pairwise = self._compute_extra_pairwise_features(
             points, features, lorentz_for_pairs, mask_float,
         ) if self.pair_extra_dim > 0 else None
+        # _compute_extra_pairwise_features always produces 6 channels.
+        # pair_extra_dim must be 0 (disabled) or 6 (all physics features).
+        if extra_pairwise is not None and extra_pairwise.shape[1] != self.pair_extra_dim:
+            raise ValueError(
+                f'pair_extra_dim={self.pair_extra_dim} but got '
+                f'{extra_pairwise.shape[1]} pairwise channels. '
+                f'Use pair_extra_dim=6 or 0.'
+            )
 
         attention_bias = self.pair_embed(
             lorentz_for_pairs, uu=extra_pairwise,
