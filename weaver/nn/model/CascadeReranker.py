@@ -1,0 +1,379 @@
+"""Stage 2 reranker: ParT-style pairwise-bias self-attention encoder.
+
+Reuses ParticleTransformer components (PairEmbed, Block, Embed) from the
+existing codebase. The key difference from standard ParT:
+    - Per-track scoring head instead of CLS token classification
+    - Stage 1 scores concatenated as an extra input feature
+    - Trained with ranking loss (same as TrackPreFilter)
+
+Architecture:
+    1. Input embedding: cat(features, stage1_score) → MLP → (P, B, embed_dim)
+    2. Pairwise features: lorentz_vectors → PairEmbed → (B*H, P, P) attention bias
+       Pairwise physics features: ln kT, ln z, ln ΔR, ln m²
+       These encode track-track relationships (e.g. ρ→ππ invariant mass).
+    3. N transformer blocks with pairwise bias in attention:
+       Attn(Q,K,V) = softmax(QK^T / √d_k + pairwise_bias) × V
+    4. Per-track scoring MLP: encoded embedding → scalar score
+
+Reference: Qu et al., ICML 2022 (arXiv:2202.03772) — Particle Transformer
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as functional
+
+from weaver.nn.model.ParticleTransformer import (
+    Block,
+    Embed,
+    PairEmbed,
+)
+
+
+class CascadeReranker(nn.Module):
+    """ParT-style pairwise-bias encoder for Stage 2 track reranking.
+
+    Args:
+        input_dim: Number of per-track features (default: 16).
+        embed_dim: Transformer embedding dimension (default: 128).
+        num_heads: Number of attention heads (default: 4).
+        num_layers: Number of transformer blocks (default: 3).
+        pair_input_dim: Number of pairwise Lorentz vector features (default: 4).
+            4 = ln kT, ln z, ln ΔR, ln m².
+        pair_embed_dims: MLP dims for pairwise feature embedding.
+        ffn_ratio: Feed-forward expansion ratio in transformer blocks.
+        dropout: Dropout rate in transformer blocks.
+        ranking_num_samples: Negatives sampled per positive in ranking loss.
+        ranking_temperature: Temperature for ranking loss.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 16,
+        embed_dim: int = 128,
+        num_heads: int = 4,
+        num_layers: int = 3,
+        pair_input_dim: int = 4,
+        pair_extra_dim: int = 0,
+        pair_embed_dims: list[int] | None = None,
+        pair_embed_mode: str = 'concat',
+        ffn_ratio: int = 4,
+        dropout: float = 0.1,
+        ranking_num_samples: int = 50,
+        ranking_temperature: float = 1.0,
+    ):
+        super().__init__()
+        self.ranking_num_samples = ranking_num_samples
+        self.ranking_temperature = ranking_temperature
+        self.pair_extra_dim = pair_extra_dim
+
+        if pair_embed_dims is None:
+            pair_embed_dims = [64, 64]
+
+        # Input embedding: cat(features, stage1_score) → embed_dim
+        # +1 for stage1_score channel
+        self.embed = Embed(
+            input_dim + 1,
+            dims=[embed_dim],
+            normalize_input=True,
+        )
+
+        # Pairwise feature embedding: lorentz_vectors (+ physics features) → attention bias
+        # PairEmbed outputs (B*num_heads, P, P) used as attn_mask in Block.
+        #
+        # pair_input_dim: Lorentz-vector features (ln kT, ln z, ln ΔR, ln m²).
+        # pair_extra_dim: Physics pairwise features passed via `uu` argument:
+        #   ch 1: charge_product q_i × q_j — rho→π⁺π⁻ requires OS pair
+        #   ch 2: |Δdz_sig| — shared tau vertex in longitudinal plane
+        #   ch 3: rho_indicator exp(-(m_ij − 770)² / 2σ²) — ρ(770) mass resonance
+        #   ch 4: rho_os_indicator (OS × rho_indicator) — conjunction
+        #   ch 5: dxy_phi_corrected |Δdxy| / |2sin(Δφ/2)| — φ-corrected vertex compat
+        self.pair_embed = PairEmbed(
+            pairwise_lv_dim=pair_input_dim,
+            pairwise_input_dim=pair_extra_dim,
+            dims=pair_embed_dims + [num_heads],
+            remove_self_pair=False,
+            use_pre_activation_pair=True,
+            mode=pair_embed_mode,
+        )
+
+        # Transformer blocks with pairwise attention bias
+        block_config = dict(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            ffn_ratio=ffn_ratio,
+            dropout=dropout,
+            attn_dropout=dropout,
+            activation_dropout=dropout,
+            activation='gelu',
+            scale_fc=True,
+            scale_attn=True,
+            scale_heads=True,
+            scale_resids=True,
+        )
+        self.blocks = nn.ModuleList([
+            Block(**block_config) for _ in range(num_layers)
+        ])
+
+        self.output_norm = nn.LayerNorm(embed_dim)
+
+        # Per-track scoring head: encoded embedding → scalar score
+        self.scoring_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, 1),
+        )
+
+    def forward(
+        self,
+        points: torch.Tensor,
+        features: torch.Tensor,
+        lorentz_vectors: torch.Tensor,
+        mask: torch.Tensor,
+        stage1_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score each track using pairwise-bias self-attention.
+
+        Args:
+            points: (B, 2, K1) coordinates in (η, φ).
+            features: (B, input_dim, K1) per-track features.
+            lorentz_vectors: (B, 4, K1) raw 4-vectors (px, py, pz, E).
+            mask: (B, 1, K1) validity mask.
+            stage1_scores: (B, K1) scores from Stage 1 pre-filter.
+
+        Returns:
+            scores: (B, K1) per-track scores. Padded tracks get -inf.
+        """
+        valid_mask = mask.squeeze(1).bool()  # (B, K1)
+        padding_mask = ~valid_mask  # (B, K1) — True for padded positions
+        mask_float = mask.float()
+
+        # Concatenate stage1 scores as an extra feature channel.
+        # Replace -inf (padded tracks from select_top_k) with 0 before
+        # multiplication — (-inf * 0.0 = NaN) in float arithmetic.
+        safe_stage1_scores = stage1_scores.masked_fill(
+            ~valid_mask, 0.0,
+        )
+        stage1_channel = safe_stage1_scores.unsqueeze(1)  # (B, 1, K1)
+        combined_features = torch.cat(
+            [features, stage1_channel], dim=1,
+        ) * mask_float  # (B, input_dim+1, K1)
+
+        # Input embedding: (B, C, K1) → (K1, B, embed_dim)
+        track_embeddings = self.embed(combined_features)
+        track_embeddings = track_embeddings.masked_fill(
+            ~mask.bool().permute(2, 0, 1), 0,
+        )
+
+        # Pairwise attention bias from Lorentz vectors + physics features:
+        # PairEmbed computes ln kT, ln z, ln ΔR, ln m² for all pairs
+        # and projects to (B, num_heads, K1, K1) → reshape to (B*H, K1, K1)
+        #
+        # .detach() prevents NaN gradients from pairwise_lv_fts():
+        # sqrt(ΔR²) has gradient 0.5/sqrt(0) = inf for self-pairs (ΔR=0).
+        # Pairwise features are physics constants used as attention bias —
+        # they don't need gradients w.r.t. input 4-vectors.
+        # .float() ensures float32 precision for the ln/sqrt operations
+        # even when AMP casts the rest to float16.
+        lorentz_for_pairs = (lorentz_vectors * mask_float).detach().float()
+
+        # Compute additional physics-motivated pairwise features
+        extra_pairwise = self._compute_extra_pairwise_features(
+            points, features, lorentz_for_pairs, mask_float,
+        ) if self.pair_extra_dim > 0 else None
+
+        attention_bias = self.pair_embed(
+            lorentz_for_pairs, uu=extra_pairwise,
+        )  # (B, num_heads, K1, K1)
+        num_heads = attention_bias.shape[1]
+        attention_bias = attention_bias.view(
+            -1, num_heads, attention_bias.shape[2], attention_bias.shape[3],
+        ).reshape(-1, attention_bias.shape[2], attention_bias.shape[3])
+        # (B*num_heads, K1, K1)
+
+        # Transformer blocks with pairwise bias
+        # Block expects: x=(K1, B, embed_dim), padding_mask=(B, K1),
+        #                attn_mask=(B*H, K1, K1)
+        encoded = track_embeddings
+        for block in self.blocks:
+            encoded = block(
+                encoded,
+                x_cls=None,
+                padding_mask=padding_mask,
+                attn_mask=attention_bias,
+            )
+
+        # Per-track scoring: (K1, B, embed_dim) → (B, K1)
+        encoded = self.output_norm(encoded)  # (K1, B, embed_dim)
+        encoded = encoded.permute(1, 0, 2)  # (B, K1, embed_dim)
+        scores = self.scoring_head(encoded).squeeze(-1)  # (B, K1)
+
+        # Mask padded tracks
+        scores = scores.masked_fill(padding_mask, float('-inf'))
+
+        return scores
+
+    def _compute_extra_pairwise_features(
+        self,
+        points: torch.Tensor,
+        features: torch.Tensor,
+        lorentz_for_pairs: torch.Tensor,
+        mask_float: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute physics-motivated pairwise features for attention bias.
+
+        These features exploit tau→3pi decay signatures that the generic
+        Lorentz features (ln kT, ln z, ln ΔR, ln m²) don't capture:
+        - Charge pairing (rho→π⁺π⁻ requires opposite sign)
+        - Vertex compatibility (pions share the tau decay vertex)
+        - Rho mass resonance (m_ij ~ 770 MeV for the rho daughter pair)
+
+        Args:
+            points: (B, 2, K1) — (eta, phi) coordinates, unstandardized.
+            features: (B, input_dim, K1) — standardized per-track features.
+            lorentz_for_pairs: (B, 4, K1) — detached float32 4-vectors.
+            mask_float: (B, 1, K1) — float mask (1=valid, 0=padded).
+
+        Returns:
+            (B, pair_extra_dim, K1, K1) — pairwise feature tensor.
+        """
+        # Pair validity mask: zero out features involving padded tracks
+        # pair_mask[b, 0, i, j] = 1 iff both tracks i and j are valid
+        pair_mask = mask_float.unsqueeze(-1) * mask_float.unsqueeze(-2)
+
+        # --- Channel 1: charge product q_i × q_j ---
+        # Standardized charge has center=1.0, scale=0.5:
+        #   raw +1 → standardized 0.0, raw -1 → standardized -1.0
+        # Recover raw: charge_raw = standardized / 0.5 + 1.0
+        charge_raw = (features[:, 5:6, :] / 0.5 + 1.0) * mask_float
+        # q_i × q_j: (B, 1, K1, 1) × (B, 1, 1, K1) → (B, 1, K1, K1)
+        charge_product = charge_raw.unsqueeze(-1) * charge_raw.unsqueeze(-2)
+
+        # --- Channel 2: dz compatibility |dz_sig_i − dz_sig_j| ---
+        # All 3 tau pions share the decay vertex → similar dz_significance.
+        # Feature index 7 = track_log_dz_significance.
+        dz_sig = features[:, 7:8, :] * mask_float
+        dz_diff = (dz_sig.unsqueeze(-1) - dz_sig.unsqueeze(-2)).abs()
+
+        # --- Channel 3: rho mass indicator exp(-(m_ij − 770)² / 2σ²) ---
+        # The ρ(770) → π⁺π⁻ decay produces a mass peak at 770 MeV.
+        # Gaussian with σ = 75 MeV highlights pairs near the resonance.
+        # m_ij = sqrt((E_i + E_j)² − |p_i + p_j|²)
+        lv = lorentz_for_pairs  # (B, 4, K1)
+        px, py, pz, energy = lv[:, 0:1], lv[:, 1:2], lv[:, 2:3], lv[:, 3:4]
+        sum_energy = energy.unsqueeze(-1) + energy.unsqueeze(-2)
+        sum_px = px.unsqueeze(-1) + px.unsqueeze(-2)
+        sum_py = py.unsqueeze(-1) + py.unsqueeze(-2)
+        sum_pz = pz.unsqueeze(-1) + pz.unsqueeze(-2)
+        m_squared = (
+            sum_energy ** 2 - sum_px ** 2 - sum_py ** 2 - sum_pz ** 2
+        ).clamp(min=1e-10)
+        m_ij = m_squared.sqrt()  # (B, 1, K1, K1)
+        rho_indicator = torch.exp(
+            -0.5 * ((m_ij - 0.770) / 0.075) ** 2,
+        )
+
+        # --- Channel 4: rho OS indicator (OS × rho_indicator) ---
+        # Conjunction of charge and mass: targets the specific ρ→π⁺π⁻ pair.
+        # |d'| = 0.57, stronger than either component alone (0.33, 0.53).
+        is_opposite_sign = (charge_product < 0).float()
+        rho_os_indicator = is_opposite_sign * rho_indicator
+
+        # --- Channel 5: phi-corrected dxy compatibility ---
+        # Raw |dxy_i − dxy_j| has |d'| = 0.11 (poor) because dxy depends on
+        # track φ relative to the flight direction. The correction divides by
+        # |2 sin(Δφ/2)| which removes the φ-dependence for same-vertex tracks:
+        #   d0_i − d0_j ≈ x_v(sinφ_j − sinφ_i) + y_v(cosφ_i − cosφ_j)
+        # After correction: |d'| = 0.39.
+        dxy_sig = features[:, 6:7, :] * mask_float
+        dxy_diff = (dxy_sig.unsqueeze(-1) - dxy_sig.unsqueeze(-2)).abs()
+        phi_raw = points[:, 1:2, :]  # unstandardized φ
+        delta_phi = phi_raw.unsqueeze(-1) - phi_raw.unsqueeze(-2)
+        delta_phi = (delta_phi + torch.pi) % (2 * torch.pi) - torch.pi
+        sin_half_dphi = torch.abs(torch.sin(delta_phi / 2.0))
+        # Clamp to avoid division by zero for nearly parallel tracks
+        dxy_phi_corrected = dxy_diff / (2.0 * sin_half_dphi).clamp(min=0.05)
+
+        # Stack and mask: (B, 5, K1, K1)
+        extra_pairwise = torch.cat([
+            charge_product,
+            dz_diff,
+            rho_indicator,
+            rho_os_indicator,
+            dxy_phi_corrected,
+        ], dim=1) * pair_mask
+
+        return extra_pairwise
+
+    def compute_loss(
+        self,
+        points: torch.Tensor,
+        features: torch.Tensor,
+        lorentz_vectors: torch.Tensor,
+        mask: torch.Tensor,
+        track_labels: torch.Tensor,
+        stage1_scores: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute temperature-scaled pairwise ranking loss.
+
+        Loss = T × softplus((s_neg - s_pos) / T)
+
+        Same ranking loss as TrackPreFilter, operating on the filtered
+        K1-track set where positives are enriched relative to the full event.
+
+        Returns:
+            dict with 'total_loss', 'ranking_loss', '_scores'.
+        """
+        scores = self.forward(
+            points, features, lorentz_vectors, mask, stage1_scores,
+        )
+        valid_mask = mask.squeeze(1).bool()
+        labels = (
+            track_labels.squeeze(1)[:, :scores.shape[1]] * valid_mask.float()
+        )
+
+        batch_size = scores.shape[0]
+        temperature = self.ranking_temperature
+        event_losses = []
+
+        for event_index in range(batch_size):
+            event_scores = scores[event_index]
+            event_labels = labels[event_index]
+            event_valid = valid_mask[event_index]
+
+            positive_indices = (
+                (event_labels == 1.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+            negative_indices = (
+                (event_labels == 0.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+
+            if len(positive_indices) == 0 or len(negative_indices) == 0:
+                continue
+
+            num_samples = min(self.ranking_num_samples, len(negative_indices))
+            sample_idx = torch.randint(
+                0, len(negative_indices), (num_samples,),
+                device=scores.device,
+            )
+            sampled_negatives = negative_indices[sample_idx]
+
+            positive_scores = event_scores[positive_indices].unsqueeze(1)
+            negative_scores = event_scores[sampled_negatives].unsqueeze(0)
+
+            # L = T × log(1 + exp((s_neg - s_pos) / T))
+            scaled_margin = (negative_scores - positive_scores) / temperature
+            pairwise_loss = temperature * functional.softplus(scaled_margin)
+            event_losses.append(pairwise_loss.mean())
+
+        if not event_losses:
+            ranking_loss = torch.tensor(
+                0.0, device=scores.device, dtype=scores.dtype,
+            )
+        else:
+            ranking_loss = torch.stack(event_losses).mean()
+
+        return {
+            'total_loss': ranking_loss,
+            'ranking_loss': ranking_loss,
+            '_scores': scores,
+        }
