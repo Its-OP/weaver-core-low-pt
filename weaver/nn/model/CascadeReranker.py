@@ -59,11 +59,26 @@ class CascadeReranker(nn.Module):
         dropout: float = 0.1,
         ranking_num_samples: int = 50,
         ranking_temperature: float = 1.0,
+        loss_mode: str = 'pairwise',
+        boundary_sampling: bool = False,
+        rs_at_k_target: int = 200,
+        rs_at_k_tau1: float = 1.0,
+        rs_at_k_tau2: float = 1.0,
     ):
         super().__init__()
         self.ranking_num_samples = ranking_num_samples
         self.ranking_temperature = ranking_temperature
         self.pair_extra_dim = pair_extra_dim
+        self.loss_mode = loss_mode
+        self.boundary_sampling = boundary_sampling
+        self.rs_at_k_target = rs_at_k_target
+        self.rs_at_k_tau1 = rs_at_k_tau1
+        self.rs_at_k_tau2 = rs_at_k_tau2
+        # For hybrid_lambda mode: fraction of training with pure pairwise
+        # before LambdaRank starts ramping in. Default 0.4 → at 100 epochs,
+        # LambdaRank kicks in at epoch 40.
+        self.lambda_rank_warmup_fraction = 0.4
+        self._training_progress: float = 0.0
 
         if pair_embed_dims is None:
             pair_embed_dims = [64, 64]
@@ -304,6 +319,14 @@ class CascadeReranker(nn.Module):
 
         return extra_pairwise
 
+    def set_training_progress(self, progress: float) -> None:
+        """Set training progress for hybrid_lambda loss annealing.
+
+        Args:
+            progress: float in [0, 1], where 0 = start, 1 = end of training.
+        """
+        self._training_progress = progress
+
     def compute_loss(
         self,
         points: torch.Tensor,
@@ -313,15 +336,20 @@ class CascadeReranker(nn.Module):
         track_labels: torch.Tensor,
         stage1_scores: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Compute temperature-scaled pairwise ranking loss.
+        """Compute ranking loss with togglable mode.
 
-        Loss = T × softplus((s_neg - s_pos) / T)
-
-        Same ranking loss as TrackPreFilter, operating on the filtered
-        K1-track set where positives are enriched relative to the full event.
+        Modes:
+            'pairwise': L = T * softplus((s_neg - s_pos) / T)
+                Standard pairwise ranking loss with random negative sampling.
+            'lambda_rank': Same pairwise loss, but weighted by |DR@K|.
+                Only pairs straddling the rank-K boundary get nonzero weight.
+            'rs_at_k': RS@K = (1/|P|) sum_p sigma_t1(K - sum_n sigma_t2(s_n - s_p))
+                Differentiable R@K surrogate (Patel et al., CVPR 2022).
+            'hybrid_lambda': (1-alpha)*pairwise + alpha*lambda_rank
+                Anneals alpha from 0 to 1 after warmup_fraction of training.
 
         Returns:
-            dict with 'total_loss', 'ranking_loss', '_scores'.
+            dict with 'total_loss', 'ranking_loss', and '_scores'.
         """
         scores = self.forward(
             points, features, lorentz_vectors, mask, stage1_scores,
@@ -331,8 +359,31 @@ class CascadeReranker(nn.Module):
             track_labels.squeeze(1)[:, :scores.shape[1]] * valid_mask.float()
         )
 
+        if self.loss_mode == 'rs_at_k':
+            loss_dict = self._rs_at_k_loss(scores, labels, valid_mask)
+        elif self.loss_mode == 'hybrid_lambda':
+            loss_dict = self._hybrid_lambda_loss(scores, labels, valid_mask)
+        else:
+            loss_dict = self._pairwise_ranking_loss(scores, labels, valid_mask)
+
+        loss_dict['_scores'] = scores
+        return loss_dict
+
+    def _pairwise_ranking_loss(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Pairwise or LambdaRank loss depending on self.loss_mode.
+
+        LambdaRank weights each (pos, neg) pair by whether swapping them
+        would change R@K. Only pairs where one track is in the current
+        top-K and the other isn't receive nonzero gradient.
+        """
         batch_size = scores.shape[0]
         temperature = self.ranking_temperature
+        k_boundary = self.rs_at_k_target
         event_losses = []
 
         for event_index in range(batch_size):
@@ -350,19 +401,67 @@ class CascadeReranker(nn.Module):
             if len(positive_indices) == 0 or len(negative_indices) == 0:
                 continue
 
-            num_samples = min(self.ranking_num_samples, len(negative_indices))
-            sample_idx = torch.randint(
-                0, len(negative_indices), (num_samples,),
-                device=scores.device,
-            )
-            sampled_negatives = negative_indices[sample_idx]
+            # Negative sampling: boundary-focused or random
+            if self.boundary_sampling:
+                masked_scores = event_scores.clone()
+                masked_scores[~event_valid] = float('-inf')
+                ranks = torch.argsort(
+                    torch.argsort(masked_scores, descending=True),
+                )
+                neg_ranks = ranks[negative_indices]
+                boundary_mask = (
+                    (neg_ranks >= max(0, k_boundary - 50))
+                    & (neg_ranks < k_boundary + 50)
+                )
+                if boundary_mask.any():
+                    boundary_neg = negative_indices[boundary_mask]
+                    num_samples = min(self.ranking_num_samples, len(boundary_neg))
+                    sample_idx = torch.randint(
+                        0, len(boundary_neg), (num_samples,),
+                        device=scores.device,
+                    )
+                    sampled_negatives = boundary_neg[sample_idx]
+                else:
+                    num_samples = min(self.ranking_num_samples, len(negative_indices))
+                    sample_idx = torch.randint(
+                        0, len(negative_indices), (num_samples,),
+                        device=scores.device,
+                    )
+                    sampled_negatives = negative_indices[sample_idx]
+            else:
+                num_samples = min(self.ranking_num_samples, len(negative_indices))
+                sample_idx = torch.randint(
+                    0, len(negative_indices), (num_samples,),
+                    device=scores.device,
+                )
+                sampled_negatives = negative_indices[sample_idx]
 
             positive_scores = event_scores[positive_indices].unsqueeze(1)
             negative_scores = event_scores[sampled_negatives].unsqueeze(0)
 
-            # L = T × log(1 + exp((s_neg - s_pos) / T))
+            # L = T * softplus((s_neg - s_pos) / T)
             scaled_margin = (negative_scores - positive_scores) / temperature
             pairwise_loss = temperature * functional.softplus(scaled_margin)
+
+            if self.loss_mode == 'lambda_rank':
+                with torch.no_grad():
+                    masked_scores = event_scores.clone()
+                    masked_scores[~event_valid] = float('-inf')
+                    ranks = torch.argsort(
+                        torch.argsort(masked_scores, descending=True),
+                    )
+                    pos_ranks = ranks[positive_indices]
+                    neg_ranks = ranks[sampled_negatives]
+                    pos_in_topk = (pos_ranks < k_boundary).float().unsqueeze(1)
+                    neg_in_topk = (neg_ranks < k_boundary).float().unsqueeze(0)
+                    n_gt = max(1, len(positive_indices))
+                    lambda_weights = (
+                        (pos_in_topk * (1.0 - neg_in_topk))
+                        + ((1.0 - pos_in_topk) * neg_in_topk)
+                    ) / n_gt
+
+                pairwise_loss = pairwise_loss * lambda_weights
+
             event_losses.append(pairwise_loss.mean())
 
         if not event_losses:
@@ -375,5 +474,105 @@ class CascadeReranker(nn.Module):
         return {
             'total_loss': ranking_loss,
             'ranking_loss': ranking_loss,
-            '_scores': scores,
+        }
+
+    def _rs_at_k_loss(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Differentiable R@K surrogate loss (Patel et al., CVPR 2022).
+
+        RS@K = (1/|P|) * sum_p sigma_t1(K - sum_n sigma_t2(s_n - s_p))
+
+        The loss is 1 - RS@K (minimize to maximize recall).
+        """
+        batch_size = scores.shape[0]
+        k_target = self.rs_at_k_target
+        tau1 = self.rs_at_k_tau1
+        tau2 = self.rs_at_k_tau2
+        event_losses = []
+
+        for event_index in range(batch_size):
+            event_scores = scores[event_index]
+            event_labels = labels[event_index]
+            event_valid = valid_mask[event_index]
+
+            positive_indices = (
+                (event_labels == 1.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+            negative_indices = (
+                (event_labels == 0.0) & event_valid
+            ).nonzero(as_tuple=True)[0]
+
+            if len(positive_indices) == 0 or len(negative_indices) == 0:
+                continue
+
+            pos_scores = event_scores[positive_indices]
+            neg_scores = event_scores[negative_indices]
+
+            # score_diffs[p, n] = s_neg[n] - s_pos[p]
+            score_diffs = neg_scores.unsqueeze(0) - pos_scores.unsqueeze(1)
+            soft_rank_contributions = torch.sigmoid(score_diffs / tau2)
+            soft_ranks = soft_rank_contributions.sum(dim=1)
+            in_top_k = torch.sigmoid((k_target - soft_ranks) / tau1)
+            rs_at_k = in_top_k.mean()
+            event_losses.append(1.0 - rs_at_k)
+
+        if not event_losses:
+            rs_loss = torch.tensor(
+                0.0, device=scores.device, dtype=scores.dtype,
+            )
+        else:
+            rs_loss = torch.stack(event_losses).mean()
+
+        return {
+            'total_loss': rs_loss,
+            'ranking_loss': rs_loss,
+            'rs_at_k_loss': rs_loss,
+        }
+
+    def _hybrid_lambda_loss(
+        self,
+        scores: torch.Tensor,
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Hybrid loss: pairwise early, LambdaRank late.
+
+        L = (1 - alpha) * L_pairwise + alpha * L_lambda_rank
+
+        alpha ramps from 0 to 1 after lambda_rank_warmup_fraction of training.
+        With warmup_fraction=0.4 and 100 epochs, LambdaRank starts at epoch 40.
+        """
+        warmup = self.lambda_rank_warmup_fraction
+        progress = self._training_progress
+
+        if progress <= warmup:
+            alpha = 0.0
+        else:
+            alpha = (progress - warmup) / (1.0 - warmup)
+            alpha = min(alpha, 1.0)
+
+        original_mode = self.loss_mode
+
+        self.loss_mode = 'pairwise'
+        pairwise_dict = self._pairwise_ranking_loss(scores, labels, valid_mask)
+
+        self.loss_mode = 'lambda_rank'
+        lambda_dict = self._pairwise_ranking_loss(scores, labels, valid_mask)
+
+        self.loss_mode = original_mode
+
+        pairwise_loss = pairwise_dict['ranking_loss']
+        lambda_loss = lambda_dict['ranking_loss']
+        combined = (1.0 - alpha) * pairwise_loss + alpha * lambda_loss
+
+        return {
+            'total_loss': combined,
+            'ranking_loss': combined,
+            'pairwise_loss': pairwise_loss,
+            'lambda_rank_loss': lambda_loss,
+            'lambda_alpha': torch.tensor(alpha, device=scores.device),
         }
