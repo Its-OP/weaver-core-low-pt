@@ -72,10 +72,11 @@ class CascadeReranker(nn.Module):
         self.rs_at_k_target = rs_at_k_target
         self.rs_at_k_tau1 = rs_at_k_tau1
         self.rs_at_k_tau2 = rs_at_k_tau2
-        # For hybrid_lambda mode: fraction of training with pure pairwise
-        # before LambdaRank starts ramping in. Default 0.4 → at 100 epochs,
-        # LambdaRank kicks in at epoch 40.
-        self.lambda_rank_warmup_fraction = 0.4
+        # For hybrid_lambda mode: pure pairwise until warmup_start, then ramp
+        # LambdaRank to full weight by warmup_end.
+        # Default: start at progress=0.4 (epoch 40/100), full by 0.7 (epoch 70/100).
+        self.lambda_rank_warmup_start = 0.4
+        self.lambda_rank_warmup_end = 0.7
         self._training_progress: float = 0.0
 
         if pair_embed_dims is None:
@@ -542,17 +543,19 @@ class CascadeReranker(nn.Module):
 
         L = (1 - alpha) * L_pairwise + alpha * L_lambda_rank
 
-        alpha ramps from 0 to 1 after lambda_rank_warmup_fraction of training.
-        With warmup_fraction=0.4 and 100 epochs, LambdaRank starts at epoch 40.
+        Alpha ramps from 0 to 1 between warmup_start and warmup_end.
+        Default: epoch 40 → epoch 70 (at 100 total epochs).
         """
-        warmup = self.lambda_rank_warmup_fraction
+        start = self.lambda_rank_warmup_start
+        end = self.lambda_rank_warmup_end
         progress = self._training_progress
 
-        if progress <= warmup:
+        if progress <= start:
             alpha = 0.0
+        elif progress >= end:
+            alpha = 3.0
         else:
-            alpha = (progress - warmup) / (1.0 - warmup)
-            alpha = min(alpha, 1.0)
+            alpha = 3.0 * (progress - start) / (end - start)
 
         original_mode = self.loss_mode
 
