@@ -569,7 +569,11 @@ class CascadeReranker(nn.Module):
 
         pairwise_loss = pairwise_dict['ranking_loss']
         lambda_loss = lambda_dict['ranking_loss']
-        combined = (1.0 - alpha) * pairwise_loss + alpha * lambda_loss
+        # Pairwise reduces from 1.0 to 0.5; lambda scales from 0 to 3.
+        # At alpha=0: 1.0*pairwise + 0*lambda (pure pairwise)
+        # At alpha=3: 0.5*pairwise + 3*lambda (lambda dominates, pairwise anchors)
+        pairwise_weight = 1.0 - alpha / 6.0  # 1.0 → 0.5 as alpha goes 0 → 3
+        combined = pairwise_weight * pairwise_loss + alpha * lambda_loss
 
         return {
             'total_loss': combined,
