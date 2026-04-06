@@ -60,6 +60,7 @@ class TrackPreFilter(nn.Module):
         aggregation_mode: str = 'max',
         focal_gamma: float = 0.0,
         contrastive_denoising_negative_sigma: float = 0.0,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.mode = mode
@@ -70,6 +71,12 @@ class TrackPreFilter(nn.Module):
         self.use_lorentz_vectors = use_lorentz_vectors
         self.num_message_rounds = num_message_rounds
         self.use_gap_attention = use_gap_attention
+        # Dropout rate for the mlp-mode MLP hidden layers. 0.0 preserves the
+        # pre-2026-04-07 behavior (zero dropout, the regime where the
+        # dim256+cutoff run overfit at ~2pp val/train gap). Only the
+        # mlp-mode branch currently plumbs this through — other modes
+        # (two_tower/autoencoder/hybrid) retain their original architecture.
+        self.dropout = dropout
 
         # Temperature scheduling (Kukleva et al., ICLR 2023):
         # σ(t) linearly interpolates between sigma_start and sigma_end.
@@ -114,37 +121,78 @@ class TrackPreFilter(nn.Module):
             self._gap_layers = nn.ModuleList()
 
         if mode == 'mlp':
-            # Per-track MLP
-            self.track_mlp = nn.Sequential(
+            # Dropout insertion is CONDITIONAL on `dropout > 0`, not
+            # unconditional. nn.Dropout has no parameters, but adding it
+            # to a Sequential still occupies an index — which shifts every
+            # subsequent Conv1d / BatchNorm1d state_dict key. Pre-2026-04-07
+            # checkpoints were trained without dropout and have keys like
+            # `track_mlp.3.weight` (second Conv1d at index 3) and
+            # `scorer.3.weight` (final Conv1d at index 3). Preserving the
+            # zero-dropout code path means those checkpoints still load
+            # cleanly into a `dropout=0.0` model (the class default and
+            # what `recall_at_k_sweep.load_prefilter_from_checkpoint` uses).
+            # When `dropout > 0` the user is training from scratch, so
+            # losing backward compat is acceptable.
+            use_dropout = dropout > 0
+
+            # --- Per-track MLP ---
+            # Standard BN→ReLU→Dropout ordering for two Conv1d blocks.
+            track_mlp_layers: list[nn.Module] = [
                 nn.Conv1d(input_dim, hidden_dim, kernel_size=1, bias=False),
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
+            ]
+            if use_dropout:
+                track_mlp_layers.append(nn.Dropout(p=dropout))
+            track_mlp_layers += [
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
-            )
-            # Neighbor aggregation — repeated for each message round
+            ]
+            if use_dropout:
+                track_mlp_layers.append(nn.Dropout(p=dropout))
+            self.track_mlp = nn.Sequential(*track_mlp_layers)
+
+            # --- Neighbor aggregation, one Sequential per message round ---
             if aggregation_mode == 'pna':
                 # PNA: cat([current, mean, max, min, std]) = 5 * hidden_dim
                 neighbor_input_dim = 5 * hidden_dim
             else:
                 # Standard: cat([current, max_pooled]) = 2 * hidden_dim
                 neighbor_input_dim = 2 * hidden_dim
-            self.neighbor_mlps = nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv1d(neighbor_input_dim, hidden_dim, kernel_size=1, bias=False),
+
+            def _build_neighbor_mlp() -> nn.Sequential:
+                layers: list[nn.Module] = [
+                    nn.Conv1d(
+                        neighbor_input_dim, hidden_dim, kernel_size=1, bias=False,
+                    ),
                     nn.BatchNorm1d(hidden_dim),
                     nn.ReLU(),
-                )
-                for _ in range(num_message_rounds)
+                ]
+                if use_dropout:
+                    layers.append(nn.Dropout(p=dropout))
+                return nn.Sequential(*layers)
+
+            self.neighbor_mlps = nn.ModuleList([
+                _build_neighbor_mlp() for _ in range(num_message_rounds)
             ])
-            # Scoring head
-            self.scorer = nn.Sequential(
+
+            # --- Scoring head ---
+            # Dropout goes after the middle ReLU only. The final
+            # Conv1d(hidden_dim → 1) is the output layer and MUST NOT have
+            # a Dropout before it in the zero-dropout path (that would
+            # shift its key from scorer.3 to scorer.4 and break backward
+            # compat). With `use_dropout=True` we accept the shift — the
+            # new run is training from scratch anyway.
+            scorer_layers: list[nn.Module] = [
                 nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
-                nn.Conv1d(hidden_dim, 1, kernel_size=1),
-            )
+            ]
+            if use_dropout:
+                scorer_layers.append(nn.Dropout(p=dropout))
+            scorer_layers.append(nn.Conv1d(hidden_dim, 1, kernel_size=1))
+            self.scorer = nn.Sequential(*scorer_layers)
 
         elif mode == 'two_tower':
             # Track tower
