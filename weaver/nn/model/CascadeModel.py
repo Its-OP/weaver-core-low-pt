@@ -121,11 +121,20 @@ class CascadeModel(nn.Module):
         lorentz_vectors: torch.Tensor,
         mask: torch.Tensor,
         track_labels: torch.Tensor,
+        use_contrastive_denoising: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Run cascade and compute Stage 2 loss on filtered tracks.
 
         Also computes Stage 1 recall@K1 for monitoring (how many GT tracks
         survived the filter).
+
+        Args:
+            points, features, lorentz_vectors, mask, track_labels: Full-event
+                inputs before Stage 1 filtering.
+            use_contrastive_denoising: Forwarded to ``stage2.compute_loss``.
+                Training scripts should pass ``False`` from their validation
+                loop so the denoising auxiliary term doesn't inflate val loss
+                when the model is flipped to ``train()`` for BatchNorm stats.
 
         Returns:
             dict with 'total_loss', Stage 2 components, 'stage1_recall_at_k1',
@@ -135,7 +144,9 @@ class CascadeModel(nn.Module):
             points, features, lorentz_vectors, mask, track_labels,
         )
 
-        # Stage 2 loss on the filtered tracks
+        # Stage 2 loss on the filtered tracks. Forward the denoising kwarg
+        # so the caller (training script) can disable it in the validate
+        # loop without touching any instance state.
         loss_dict = self.stage2.compute_loss(
             filtered['points'],
             filtered['features'],
@@ -143,6 +154,7 @@ class CascadeModel(nn.Module):
             filtered['mask'],
             filtered['track_labels'],
             filtered['stage1_scores'],
+            use_contrastive_denoising=use_contrastive_denoising,
         )
 
         # Stage 1 recall@K1: fraction of GT tracks that survived the filter

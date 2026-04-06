@@ -63,6 +63,10 @@ class CascadeReranker(nn.Module):
         rs_at_k_target: int = 200,
         rs_at_k_tau1: float = 1.0,
         rs_at_k_tau2: float = 1.0,
+        use_contrastive_denoising: bool = False,
+        denoising_sigma_start: float = 0.3,
+        denoising_sigma_end: float = 0.05,
+        denoising_loss_weight: float = 0.5,
     ):
         super().__init__()
         self.ranking_num_samples = ranking_num_samples
@@ -77,6 +81,17 @@ class CascadeReranker(nn.Module):
         # Default: start at progress=0.4 (epoch 40/100), full by 0.7 (epoch 70/100).
         self.lambda_rank_warmup_start = 0.4
         self.lambda_rank_warmup_end = 0.7
+        # Contrastive denoising auxiliary loss — ported from TrackPreFilter
+        # (Zhang et al. ICLR 2023, DINO-style). GT track features get small
+        # Gaussian noise (scheduled σ: start → end); a second forward pass
+        # scores the noised batch; the noised GT scores must still beat
+        # original-pass background scores. Helps regularize late-epoch
+        # overfitting. σ is interpolated using _training_progress, the same
+        # mechanism hybrid_lambda uses (set by train_cascade.py each epoch).
+        self.use_contrastive_denoising = use_contrastive_denoising
+        self.denoising_sigma_start = denoising_sigma_start
+        self.denoising_sigma_end = denoising_sigma_end
+        self.denoising_loss_weight = denoising_loss_weight
         self._training_progress: float = 0.0
 
         if pair_embed_dims is None:
@@ -348,12 +363,26 @@ class CascadeReranker(nn.Module):
         return extra_pairwise
 
     def set_training_progress(self, progress: float) -> None:
-        """Set training progress for hybrid_lambda loss annealing.
+        """Set training progress for hybrid_lambda loss annealing and
+        contrastive-denoising sigma schedule.
 
         Args:
             progress: float in [0, 1], where 0 = start, 1 = end of training.
         """
-        self._training_progress = progress
+        self._training_progress = max(0.0, min(1.0, progress))
+
+    @property
+    def current_denoising_sigma(self) -> float:
+        """Linearly interpolated sigma for contrastive denoising.
+
+        At progress=0 returns ``denoising_sigma_start``; at progress=1 returns
+        ``denoising_sigma_end``. Matches the TrackPreFilter scheduling pattern.
+        """
+        return (
+            self.denoising_sigma_start
+            + self._training_progress
+            * (self.denoising_sigma_end - self.denoising_sigma_start)
+        )
 
     def compute_loss(
         self,
@@ -363,6 +392,7 @@ class CascadeReranker(nn.Module):
         mask: torch.Tensor,
         track_labels: torch.Tensor,
         stage1_scores: torch.Tensor,
+        use_contrastive_denoising: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Compute ranking loss with togglable mode.
 
@@ -376,8 +406,14 @@ class CascadeReranker(nn.Module):
             'hybrid_lambda': (1-alpha)*pairwise + alpha*lambda_rank
                 Anneals alpha from 0 to 1 after warmup_fraction of training.
 
+        If ``use_contrastive_denoising`` is True and the model is in training
+        mode, an auxiliary denoising loss is added: noised GT track features
+        must still score above the original-pass background scores. See
+        ``_contrastive_denoising_loss`` for details.
+
         Returns:
-            dict with 'total_loss', 'ranking_loss', and '_scores'.
+            dict with 'total_loss', 'ranking_loss', '_scores', and (when
+            denoising is active) 'denoising_loss'.
         """
         scores = self.forward(
             points, features, lorentz_vectors, mask, stage1_scores,
@@ -394,8 +430,156 @@ class CascadeReranker(nn.Module):
         else:
             loss_dict = self._pairwise_ranking_loss(scores, labels, valid_mask)
 
+        # Contrastive denoising: training-only auxiliary regularizer.
+        # Mirrors TrackPreFilter's pattern — adds a second forward pass on
+        # feature-noised GT copies and requires them to still beat bg tracks.
+        #
+        # The three guards are:
+        #   - self.use_contrastive_denoising: feature configured at init
+        #   - use_contrastive_denoising kwarg: per-call override, lets the
+        #     validate() loop disable denoising even though the model is in
+        #     train() mode (necessary because train_cascade.py's validate()
+        #     flips to train() mode for BatchNorm batch stats)
+        #   - self.training: standard PyTorch training mode guard (safety net
+        #     for pure-inference callers that forget the kwarg)
+        if (
+            self.use_contrastive_denoising
+            and use_contrastive_denoising
+            and self.training
+        ):
+            denoising_loss = self._contrastive_denoising_loss(
+                points=points,
+                features=features,
+                lorentz_vectors=lorentz_vectors,
+                mask=mask,
+                track_labels=track_labels,
+                stage1_scores=stage1_scores,
+                original_scores=scores,
+            )
+            loss_dict['denoising_loss'] = denoising_loss
+            loss_dict['total_loss'] = (
+                loss_dict['total_loss']
+                + self.denoising_loss_weight * denoising_loss
+            )
+
         loss_dict['_scores'] = scores
         return loss_dict
+
+    def _contrastive_denoising_loss(
+        self,
+        points: torch.Tensor,
+        features: torch.Tensor,
+        lorentz_vectors: torch.Tensor,
+        mask: torch.Tensor,
+        track_labels: torch.Tensor,
+        stage1_scores: torch.Tensor,
+        original_scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """DINO-style contrastive denoising loss on GT track features.
+
+        Adds Gaussian noise with σ = ``current_denoising_sigma`` to the
+        *features* of GT tracks only (background features unchanged), then
+        runs a second forward pass through the full transformer. The noised
+        GT scores must still beat the (original-pass) background scores:
+
+            L_den = T · softplus( (s_bg_original − s_gt_noised) / T )
+
+        averaged per event over sampled background pairs. This is the same
+        loss structure as the main pairwise ranking loss, but applied to
+        perturbed positives — teaching the model to be invariant to small
+        feature jitter near the GT manifold.
+
+        Only ``features`` are noised — not ``lorentz_vectors`` (which drive
+        the physics pairwise attention bias) or ``stage1_scores`` (which
+        come from the frozen pre-filter on the original features).
+
+        Args:
+            points: (B, 2, K1) coordinates.
+            features: (B, input_dim, K1) original per-track features.
+            lorentz_vectors: (B, 4, K1) raw 4-vectors (unchanged by denoising).
+            mask: (B, 1, K1) validity mask.
+            track_labels: (B, 1, K1) binary GT labels.
+            stage1_scores: (B, K1) scores from the frozen Stage 1.
+            original_scores: (B, K1) scores from the original (non-noised)
+                forward pass. Used for the background comparison terms.
+
+        Returns:
+            Scalar denoising loss (0.0 if no event in the batch has GT tracks).
+        """
+        valid_mask = mask.squeeze(1).bool()  # (B, K1)
+        labels_flat = (
+            track_labels.squeeze(1)[:, :valid_mask.shape[1]]
+            * valid_mask.float()
+        )  # (B, K1)
+        gt_mask = (labels_flat == 1.0) & valid_mask  # (B, K1)
+
+        if not gt_mask.any():
+            return torch.tensor(
+                0.0, device=features.device, dtype=features.dtype,
+            )
+
+        # Build noised features: noise applied only at GT positions.
+        # gt_mask broadcasts over the feature channel dimension.
+        gt_mask_expanded = gt_mask.unsqueeze(1)  # (B, 1, K1)
+        positive_noise = (
+            torch.randn_like(features) * self.current_denoising_sigma
+        )
+        positive_noised_features = torch.where(
+            gt_mask_expanded, features + positive_noise, features,
+        )
+
+        # Second forward pass with noised features. lorentz_vectors and
+        # stage1_scores are NOT noised — they remain the physics ground truth
+        # so the attention bias and the frozen Stage 1 output stay consistent.
+        positive_noised_scores = self.forward(
+            points, positive_noised_features, lorentz_vectors, mask, stage1_scores,
+        )  # (B, K1)
+
+        batch_size = features.shape[0]
+        temperature = self.ranking_temperature
+        event_losses: list[torch.Tensor] = []
+
+        for event_index in range(batch_size):
+            gt_positions = gt_mask[event_index].nonzero(as_tuple=True)[0]
+            if len(gt_positions) == 0:
+                continue
+
+            pos_scores = positive_noised_scores[event_index, gt_positions]
+
+            negative_indices = (
+                (labels_flat[event_index] == 0.0) & valid_mask[event_index]
+            ).nonzero(as_tuple=True)[0]
+            if len(negative_indices) == 0:
+                continue
+
+            num_samples = min(
+                self.ranking_num_samples, len(negative_indices),
+            )
+            sample_idx = torch.randint(
+                0, len(negative_indices), (num_samples,),
+                device=features.device,
+            )
+            # Background scores come from the ORIGINAL forward pass
+            # (not the noised one) — matches TrackPreFilter's pattern and
+            # lets the main ranking loss + denoising loss share the same
+            # background statistics.
+            bg_scores = original_scores[
+                event_index, negative_indices[sample_idx],
+            ]
+
+            # Same pairwise softplus as _pairwise_ranking_loss, but with
+            # noised positives vs original-pass backgrounds.
+            scaled_margin = (
+                bg_scores.unsqueeze(0) - pos_scores.unsqueeze(1)
+            ) / temperature
+            pairwise_loss = temperature * functional.softplus(scaled_margin)
+            event_losses.append(pairwise_loss.mean())
+
+        if not event_losses:
+            return torch.tensor(
+                0.0, device=features.device, dtype=features.dtype,
+            )
+        return torch.stack(event_losses).mean()
 
     def _pairwise_ranking_loss(
         self,
