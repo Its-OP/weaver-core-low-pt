@@ -31,6 +31,39 @@ import torch.nn as nn
 import torch.nn.functional as functional
 
 
+class NanSafeBatchNorm1d(nn.BatchNorm1d):
+    """BatchNorm1d that skips running stat updates when inputs contain NaN/Inf.
+
+    Standard BatchNorm1d uses an EMA to update running_mean and running_var:
+        running_mean = (1 - momentum) * running_mean + momentum * batch_mean
+
+    If even one element is NaN, batch_mean becomes NaN, and the running
+    stats are permanently corrupted. This wrapper detects non-finite values
+    and skips the stat update for that batch, while still producing finite
+    output by replacing NaN/Inf with 0 before the BN forward pass.
+
+    State dict is identical to nn.BatchNorm1d — fully compatible for
+    loading/saving checkpoints.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return super().forward(x)
+
+        has_non_finite = not torch.isfinite(x).all()
+        if not has_non_finite:
+            # Fast path: clean batch, normal BN forward
+            return super().forward(x)
+
+        # Slow path: replace non-finite values with 0, run BN without
+        # updating running stats (eval-mode forward), then restore training.
+        clean_x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        self.training = False
+        output = super().forward(clean_x)
+        self.training = True
+        return output
+
+
 class ResidualBlock(nn.Module):
     """Post-activation residual block: 2× Conv1d(1×1) + BN + skip + ReLU.
 
@@ -47,12 +80,12 @@ class ResidualBlock(nn.Module):
         self.conv_1 = nn.Conv1d(
             hidden_dim, hidden_dim, kernel_size=1, bias=False,
         )
-        self.batchnorm_1 = nn.BatchNorm1d(hidden_dim)
+        self.batchnorm_1 = NanSafeBatchNorm1d(hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.conv_2 = nn.Conv1d(
             hidden_dim, hidden_dim, kernel_size=1, bias=False,
         )
-        self.batchnorm_2 = nn.BatchNorm1d(hidden_dim)
+        self.batchnorm_2 = NanSafeBatchNorm1d(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
@@ -105,7 +138,7 @@ class CoupleReranker(nn.Module):
         # Input projection: 51 → hidden_dim
         self.input_projection = nn.Sequential(
             nn.Conv1d(input_dim, hidden_dim, kernel_size=1, bias=False),
-            nn.BatchNorm1d(hidden_dim),
+            NanSafeBatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
         )
 
@@ -119,7 +152,7 @@ class CoupleReranker(nn.Module):
         intermediate_dim = hidden_dim // 2
         self.scorer = nn.Sequential(
             nn.Conv1d(hidden_dim, intermediate_dim, kernel_size=1, bias=False),
-            nn.BatchNorm1d(intermediate_dim),
+            NanSafeBatchNorm1d(intermediate_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Conv1d(intermediate_dim, 1, kernel_size=1),

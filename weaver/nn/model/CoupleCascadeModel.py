@@ -130,13 +130,24 @@ class CoupleCascadeModel(nn.Module):
             expanded_indices = top_k2_in_k1.unsqueeze(1).expand(-1, num_channels, -1)
             return tensor.gather(2, expanded_indices)
 
+        # Track validity mask: True for real tracks, False for padding.
+        # Events with fewer valid tracks than K2 fill the remaining slots
+        # with padding tracks whose Stage 2 scores are -inf (via
+        # CascadeReranker.forward masked_fill). topk selects these because
+        # -inf < all finite values, so they end up at the tail of the
+        # top-K2 list. The mask lets the couple feature builder zero out
+        # padding data and exclude couples involving padding from the loss.
+        top_k2_stage2_scores = stage2_scores.gather(1, top_k2_in_k1)
+        track_valid_mask = torch.isfinite(top_k2_stage2_scores)  # (B, K2)
+
         return {
             'features': gather_along_track_dim(filtered['features']),
             'points': gather_along_track_dim(filtered['points']),
             'lorentz_vectors': gather_along_track_dim(filtered['lorentz_vectors']),
             'stage1_scores': filtered['stage1_scores'].gather(1, top_k2_in_k1),
-            'stage2_scores': stage2_scores.gather(1, top_k2_in_k1),
+            'stage2_scores': top_k2_stage2_scores,
             'track_labels': filtered['track_labels'].squeeze(1).gather(1, top_k2_in_k1),
+            'track_valid_mask': track_valid_mask,
             'n_gt_in_top_k1': n_gt_in_top_k1,
             'n_gt_in_top_k_tracks': n_gt_in_top_k_tracks,
         }
@@ -174,6 +185,7 @@ class CoupleCascadeModel(nn.Module):
             top_k2_stage1_scores=top_k2_data['stage1_scores'],
             top_k2_stage2_scores=top_k2_data['stage2_scores'],
             top_k2_track_labels=top_k2_data['track_labels'],
+            track_valid_mask=top_k2_data['track_valid_mask'],
         )
         couple_inputs['n_gt_in_top_k1'] = top_k2_data['n_gt_in_top_k1']
         couple_inputs['n_gt_in_top_k_tracks'] = top_k2_data['n_gt_in_top_k_tracks']
